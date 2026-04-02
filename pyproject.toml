@@ -1,0 +1,38 @@
+[project]
+name = "cellmeasurement-py"
+version = "0.1.0"
+description = "Extract regions of interest from whole cell and nuclear mask images, calculate measurements and export to GeoJSON"
+readme = "README.md"
+authors = [
+    { name = "Marek Cmero", email = "cmero.ma@wehi.edu.au" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "geopandas>=1.1.3",
+    "pip>=26.0.1",
+    "spatialdata>=0.7.2",
+    "typer>=0.24.1",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-mypyc>=0.16.0"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+cellmeasurement = "cellmeasurement.cli:app"
+
+[dependency-groups]
+dev = [
+ "mypy[mypyc]>=1.19.1",
+ "pyright>=1.1.408",
+ "ruff>=0.15.8",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src"]
+sources = ["src"]
+
+[tool.hatch.build.targets.wheel.hooks.mypyc]
+enable-by-default = false
+dependencies = ["hatch-mypyc>=0.16.0", "mypy[mypyc]>=1.19.1"]
+exclude = ["src/cellmeasurement/cli.py", "src/cellmeasreuement/io/mask_reader.py"]
