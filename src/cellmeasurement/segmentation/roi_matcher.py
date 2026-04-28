@@ -488,6 +488,7 @@ def _synthesis_pass(
 
     # Growth zone: within synthesis_dist of any seed, excluding matched wc pixels.
     growth_zone = ndi.binary_dilation(seeds > 0, structure=disk(max(1, int(synthesis_dist))))
+    assert growth_zone.dtype == bool
     if matched_wc_ids:
         claimed: npt.NDArray[np.bool_] = np.isin(wc_region, list(matched_wc_ids))
         growth_zone = growth_zone & ~claimed

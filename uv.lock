@@ -220,6 +220,7 @@ dependencies = [
     { name = "scipy" },
     { name = "shapely" },
     { name = "spatialdata" },
+    { name = "tifffile" },
     { name = "typer" },
 ]
 
@@ -242,6 +243,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.10" },
     { name = "shapely", specifier = ">=2.0" },
     { name = "spatialdata", specifier = ">=0.7.2" },
+    { name = "tifffile", specifier = ">=2024.8" },
     { name = "typer", specifier = ">=0.24.1" },
 ]
 

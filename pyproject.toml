@@ -17,6 +17,7 @@ dependencies = [
     "scipy>=1.10",
     "shapely>=2.0",
     "spatialdata>=0.7.2",
+    "tifffile>=2024.8",
     "typer>=0.24.1",
 ]
 
