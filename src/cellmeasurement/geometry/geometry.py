@@ -9,7 +9,7 @@ Typical pipeline position
 1. Load masks (``SegmentationMask``)
 2. **extract_label_geometries** — chunk-parallel scan → simplified polygons
 3. ``match_rois`` — raster-based matching (unchanged)
-4. Convert synthesised masks → polygons with ``synth_masks_to_geometries``
+4. Convert synthesised masks → polygons (where needed)
 5. Measure / export using pre-simplified geometry dicts
 """
 

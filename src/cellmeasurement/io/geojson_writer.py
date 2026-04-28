@@ -1,8 +1,7 @@
 """GeoJSON export for cell match results.
 
 Converts pre-extracted Shapely polygon geometry dicts (produced by
-:func:`~cellmeasurement.io.geometry.extract_label_geometries` and
-:func:`~cellmeasurement.io.geometry.synth_masks_to_geometries`) to a
+:func:`~cellmeasurement.geometry.geometry.extract_label_geometries`) to a
 QuPath-compatible GeoJSON FeatureCollection.
 
 Output structure
@@ -30,6 +29,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from shapely.geometry import Polygon, mapping
+
+from ..geometry.overlap_constraint import constrain_cell_overlaps
 
 if TYPE_CHECKING:
     from ..segmentation.cell import CellMatch
@@ -120,6 +121,7 @@ def write_geojson(
     synth_geoms: SynthGeoms,
     output_path: Path,
     image_shape: tuple[int, int],
+    constrain_overlaps: bool = True,
     pretty: bool = False,
 ) -> int:
     """Write cell matches to a GeoJSON FeatureCollection.
@@ -129,10 +131,8 @@ def write_geojson(
 
     All polygon geometries must be pre-extracted and simplified before calling
     this function.  Use
-    :func:`~cellmeasurement.io.geometry.extract_label_geometries` for
-    label-backed masks and
-    :func:`~cellmeasurement.io.geometry.synth_masks_to_geometries` for
-    synthesised cells.
+    :func:`~cellmeasurement.geometry.geometry.extract_label_geometries` for
+    label-backed masks. Synthesised-cell polygons are provided via *synth_geoms*.
 
     Args:
         cells: List of :class:`~cellmeasurement.segmentation.cell.CellMatch`
@@ -147,6 +147,8 @@ def write_geojson(
         output_path: Destination ``.geojson`` file path.
         image_shape: ``(height, width)`` of the full image; used to build the
             annotation bounding-box feature.
+        constrain_overlaps: Whether to run overlap clipping so no two cell
+            polygons share area.
         pretty: Write indented (human-readable) JSON.
 
     Returns:
@@ -170,6 +172,9 @@ def write_geojson(
         feat = _cell_to_feature(cell, nuc_geoms, wc_geoms, synth_geoms)
         if feat is not None:
             features.append(feat)
+
+    if constrain_overlaps:
+        features = constrain_cell_overlaps(features)
 
     collection: dict = {
         "type": "FeatureCollection",

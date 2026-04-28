@@ -38,7 +38,7 @@ from shapely.geometry import Polygon
 from skimage.morphology import disk
 from skimage.segmentation import watershed
 
-from ..io.geometry import mask_to_geometry
+from ..geometry import mask_to_geometry
 from .cell import CellMatch
 from .types import (
     CellId,

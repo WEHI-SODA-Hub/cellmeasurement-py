@@ -6,7 +6,7 @@ from typing import Annotated, Optional
 import typer
 from shapely.geometry import Polygon
 
-from .io.geometry import boundaries_to_geometries, extract_label_geometries
+from .geometry import boundaries_to_geometries, extract_label_geometries
 from .io.geojson_writer import write_geojson
 from .io.mask_reader import SegmentationMask, load_mask, validate_grid_compatibility
 from .segmentation.roi_matcher import match_rois
@@ -115,6 +115,13 @@ def main(
         bool,
         typer.Option("--pretty-json/--no-pretty-json", help="Write indented JSON output."),
     ] = False,
+    constrain_overlaps: Annotated[
+        bool,
+        typer.Option(
+            "--constrain-overlaps/--no-constrain-overlaps",
+            help="Clip overlapping cell polygons before GeoJSON export.",
+        ),
+    ] = True,
 ) -> None:
     if nuclear_mask is None and whole_cell_mask is None:
         typer.echo(
@@ -168,6 +175,7 @@ def main(
             synth_geoms=synth_geoms,
             output_path=output_file,
             image_shape=image_shape,
+            constrain_overlaps=constrain_overlaps,
             pretty=pretty_json,
         )
         typer.echo(f"Exported {n_written} cell features to {output_file}.")

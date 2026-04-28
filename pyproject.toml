@@ -46,6 +46,7 @@ dependencies = ["hatch-mypyc>=0.16.0", "mypy[mypyc]>=1.19.1"]
 exclude = [
     "src/cellmeasurement/__init__.py",
     "src/cellmeasurement/cli.py",
+    "src/cellmeasurement/geometry/",
     "src/cellmeasurement/io/",
     "src/cellmeasurement/segmentation/__init__.py",
 ]
