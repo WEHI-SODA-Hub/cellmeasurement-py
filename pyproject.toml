@@ -48,5 +48,6 @@ exclude = [
     "src/cellmeasurement/cli.py",
     "src/cellmeasurement/geometry/",
     "src/cellmeasurement/io/",
+    "src/cellmeasurement/measurement/",
     "src/cellmeasurement/segmentation/__init__.py",
 ]

@@ -212,3 +212,131 @@ def test_main_preserves_primary_error_when_cleanup_fails(monkeypatch, tmp_path, 
         )
 
     assert "Failed to clean temporary zarr store" in caplog.text
+
+
+def test_main_measurements_off_by_default(monkeypatch, tmp_path):
+    class DummyMask:
+        def __init__(self):
+            self.labels = _one_pixel_labels()
+            self.shape = (1, 1)
+            self.boundaries = None
+            self.temp_store_path = None
+
+        def cleanup_temp_store(self):
+            self.temp_store_path = None
+
+    dummy = DummyMask()
+    called = {"measure": False}
+
+    monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, synthesis_dist: ([], {}))
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+
+    def fake_measure(**kwargs):
+        called["measure"] = True
+        return {}
+
+    monkeypatch.setattr(cli, "measure_cells_tiled", fake_measure)
+    monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
+
+    cli.main(
+        nuclear_mask=tmp_path / "nuc.tiff",
+        output_file=tmp_path / "out.geojson",
+        tiff_file=tmp_path / "img.tiff",
+    )
+
+    assert called["measure"] is False
+
+
+def test_main_warns_when_measurements_requested_without_tiff(monkeypatch, tmp_path, caplog):
+    class DummyMask:
+        def __init__(self):
+            self.labels = _one_pixel_labels()
+            self.shape = (1, 1)
+            self.boundaries = None
+            self.temp_store_path = None
+
+        def cleanup_temp_store(self):
+            self.temp_store_path = None
+
+    dummy = DummyMask()
+    called = {"measure": False, "writer_measurements": "unset", "writer_jsonl": "unset"}
+
+    monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, synthesis_dist: ([], {}))
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+
+    def fake_measure(**kwargs):
+        called["measure"] = True
+        return {}
+
+    def fake_write_geojson(**kwargs):
+        called["writer_measurements"] = kwargs.get("measurements_by_cell")
+        called["writer_jsonl"] = kwargs.get("measurements_jsonl_path")
+        return 0
+
+    monkeypatch.setattr(cli, "measure_cells_tiled", fake_measure)
+    monkeypatch.setattr(cli, "write_geojson", fake_write_geojson)
+
+    cli.main(
+        nuclear_mask=tmp_path / "nuc.tiff",
+        output_file=tmp_path / "out.geojson",
+        measurements=True,
+    )
+
+    assert called["measure"] is False
+    assert called["writer_measurements"] is None
+    assert called["writer_jsonl"] is None
+    assert "--tiff-file" in caplog.text
+
+
+def test_main_runs_measurements_when_enabled_with_tiff(monkeypatch, tmp_path):
+    class DummyMask:
+        def __init__(self):
+            self.labels = _one_pixel_labels()
+            self.shape = (1, 1)
+            self.boundaries = None
+            self.temp_store_path = None
+
+        def cleanup_temp_store(self):
+            self.temp_store_path = None
+
+    dummy = DummyMask()
+    called = {"measure": False, "writer_measurements": None, "writer_jsonl": None}
+
+    cell = cli.match_rois(
+        da.from_array(np.array([[1]], dtype=np.int32), chunks=(1, 1)),
+        da.from_array(np.array([[1]], dtype=np.int32), chunks=(1, 1)),
+        synthesis_dist=3.0,
+    )[0][0]
+
+    monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, synthesis_dist: ([cell], {}))
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+
+    def fake_measure(**kwargs):
+        called["measure"] = True
+        assert kwargs["tiff_file"] == tmp_path / "img.tiff"
+        assert kwargs["jsonl_path"].name.endswith(".measurements.jsonl.tmp")
+        assert kwargs["return_results"] is False
+        kwargs["jsonl_path"].write_text('{"cell_id":1,"measurements":{"Cell: Area px":1.0}}\\n', encoding="utf-8")
+        return {}
+
+    def fake_write_geojson(**kwargs):
+        called["writer_measurements"] = kwargs.get("measurements_by_cell")
+        called["writer_jsonl"] = kwargs.get("measurements_jsonl_path")
+        return 1
+
+    monkeypatch.setattr(cli, "measure_cells_tiled", fake_measure)
+    monkeypatch.setattr(cli, "write_geojson", fake_write_geojson)
+
+    cli.main(
+        nuclear_mask=tmp_path / "nuc.tiff",
+        output_file=tmp_path / "out.geojson",
+        measurements=True,
+        tiff_file=tmp_path / "img.tiff",
+    )
+
+    assert called["measure"] is True
+    assert called["writer_measurements"] is None
+    assert called["writer_jsonl"] is not None

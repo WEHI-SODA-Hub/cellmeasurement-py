@@ -9,6 +9,7 @@ from shapely.geometry import Polygon
 from .geometry import boundaries_to_geometries, extract_label_geometries
 from .io.geojson_writer import write_geojson
 from .io.mask_reader import SegmentationMask, load_mask, validate_grid_compatibility
+from .measurement import measure_cells_tiled
 from .segmentation.roi_matcher import match_rois
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -38,6 +39,28 @@ def _cleanup_mask_temp_store(mask: SegmentationMask, keep_temp_zarr: bool) -> No
         mask.cleanup_temp_store()
     except Exception:
         logging.warning("Failed to clean temporary zarr store: %s", mask.temp_store_path, exc_info=True)
+
+
+def _cleanup_measurements_jsonl(path: Path | None) -> None:
+    """Remove temporary measurement JSONL output without masking primary failures."""
+    if path is None or not path.exists():
+        return
+    try:
+        path.unlink()
+    except Exception:
+        logging.warning("Failed to clean temporary measurements JSONL: %s", path, exc_info=True)
+
+
+def _parse_percentiles(percentiles: str) -> list[float]:
+    if not percentiles.strip():
+        return []
+    values: list[float] = []
+    for token in percentiles.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    return values
 
 
 @app.command(
@@ -97,6 +120,43 @@ def main(
             )
         ),
     ] = 3.0,
+    measurements: Annotated[
+        bool,
+        typer.Option(
+            "--measurements/--no-measurements",
+            help="Enable intensity/erosion/shape measurements (default: disabled).",
+        ),
+    ] = False,
+    tiff_file: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Multi-channel TIFF image used for intensity measurements. "
+                "Required when --measurements is enabled."
+            )
+        ),
+    ] = None,
+    percentiles: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Comma-separated percentiles for intensity measurement "
+                '(e.g. "70,80,90,95").'
+            )
+        ),
+    ] = "",
+    tile_size: Annotated[
+        int,
+        typer.Option(help="Tile size in pixels for batched measurement image reads."),
+    ] = 2048,
+    tile_overlap: Annotated[
+        int,
+        typer.Option(help="Tile overlap in pixels for measurement reads."),
+    ] = 200,
+    threads: Annotated[
+        int,
+        typer.Option(help="Number of tile workers for measurements."),
+    ] = 1,
     output_file: Annotated[
         Path, typer.Option(help="Output path for the GeoJSON file.")
     ] = Path("cellmeasurement.geojson"),
@@ -128,9 +188,19 @@ def main(
             "Error: at least one of --nuclear-mask or --whole-cell-mask is required.", err=True
         )
         raise typer.Exit(code=1)
+    if tile_size <= 0:
+        typer.echo("Error: --tile-size must be > 0.", err=True)
+        raise typer.Exit(code=1)
+    if tile_overlap < 0:
+        typer.echo("Error: --tile-overlap must be >= 0.", err=True)
+        raise typer.Exit(code=1)
+    if threads <= 0:
+        typer.echo("Error: --threads must be > 0.", err=True)
+        raise typer.Exit(code=1)
 
     nuc_mask: SegmentationMask | None = None
     wc_mask: SegmentationMask | None = None
+    measurements_jsonl_path: Path | None = None
 
     try:
         if nuclear_mask is not None:
@@ -152,6 +222,38 @@ def main(
         typer.echo("Matching ROIs...")
         cells, synth_geoms = match_rois(nuc_arr, wc_arr, synthesis_dist=synthesis_dist)
         typer.echo(f"Matched {len(cells)} cells.")
+
+        measurements_by_cell: dict[int, dict[str, float]] | None = None
+        if measurements:
+            if tiff_file is None:
+                logging.warning(
+                    "Measurements requested but --tiff-file was not provided; proceeding without measurements."
+                )
+                typer.echo(
+                    "Warning: measurements requested but --tiff-file is missing; exporting without measurements.",
+                    err=True,
+                )
+            else:
+                percentile_values = _parse_percentiles(percentiles)
+                measurements_jsonl_path = output_file.with_name(
+                    f"{output_file.stem}.measurements.jsonl.tmp"
+                )
+                typer.echo("Computing measurements...")
+                measure_cells_tiled(
+                    cells=cells,
+                    nuc_labels=nuc_arr,
+                    wc_labels=wc_arr,
+                    synth_geoms=synth_geoms,
+                    tiff_file=tiff_file,
+                    image_shape=image_shape,
+                    percentiles=percentile_values,
+                    tile_size=tile_size,
+                    tile_overlap=tile_overlap,
+                    threads=threads,
+                    jsonl_path=measurements_jsonl_path,
+                    return_results=False,
+                )
+                typer.echo("Computed measurements and streamed them to temporary JSONL.")
 
         # Free label arrays — no longer needed after matching.
         del nuc_arr, wc_arr
@@ -175,6 +277,8 @@ def main(
             synth_geoms=synth_geoms,
             output_path=output_file,
             image_shape=image_shape,
+            measurements_by_cell=measurements_by_cell,
+            measurements_jsonl_path=measurements_jsonl_path,
             constrain_overlaps=constrain_overlaps,
             pretty=pretty_json,
         )
@@ -184,6 +288,7 @@ def main(
             if loaded_mask is None:
                 continue
             _cleanup_mask_temp_store(loaded_mask, keep_temp_zarr)
+        _cleanup_measurements_jsonl(measurements_jsonl_path)
 
 
 if __name__ == "__main__":

@@ -16,11 +16,12 @@ Typical pipeline position
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-import dask
 import geopandas as gpd
 import numpy as np
+from dask.delayed import delayed
+from dask.base import compute
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from skimage.measure import find_contours
@@ -101,7 +102,7 @@ def mask_to_geometry(
     # Discard non-polygon artefacts (LineStrings, Points) from boolean union.
     if g.geom_type == "GeometryCollection":
         keep = [
-            p for p in g.geoms
+            p for p in g.geoms  # type: ignore[union-attr]
             if p.geom_type in ("Polygon", "MultiPolygon") and not p.is_empty
         ]
         if not keep:
@@ -110,7 +111,7 @@ def mask_to_geometry(
 
     # Keep only the largest polygon (matches QuPath's single-polygon convention).
     if g.geom_type == "MultiPolygon":
-        g = max(g.geoms, key=lambda p: p.area)
+        g = max(g.geoms, key=lambda p: p.area)  # type: ignore[union-attr]
 
     if g.geom_type != "Polygon" or g.is_empty:
         return None
@@ -181,13 +182,13 @@ def _collect_label_bboxes(label_arr: da.Array) -> dict[int, tuple[int, int, int,
     n_col = len(label_arr.chunks[1])
     row_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[0])[:-1]]
     col_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[1])[:-1]]
-    delayed_arr = label_arr.to_delayed()
+    delayed_arr = label_arr.to_delayed()  # type: ignore[arg-type]
     delayed_results = [
-        dask.delayed(_bboxes_chunk)(delayed_arr[i, j], row_offs[i], col_offs[j])
+        delayed(_bboxes_chunk)(delayed_arr[i, j], row_offs[i], col_offs[j])
         for i in range(n_row)
         for j in range(n_col)
     ]
-    return _merge_bboxes(list(dask.compute(*delayed_results)))
+    return _merge_bboxes(list(compute(*delayed_results)))
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def _collect_label_bboxes(label_arr: da.Array) -> dict[int, tuple[int, int, int,
 # ---------------------------------------------------------------------------
 
 
-@dask.delayed
+@delayed
 def _polygonize_delayed(
     crop: np.ndarray,
     label_id: int,
@@ -252,7 +253,7 @@ def extract_label_geometries(
             _polygonize_delayed(crop, label_id, simplify, tolerance, pr0, pc0)
         )
 
-    computed: tuple[Polygon | None, ...] = dask.compute(*delayed_geoms)
+    computed: tuple[Polygon | None, ...] = compute(*delayed_geoms)
 
     geoms: dict[int, Polygon] = {}
     for label_id, poly in zip(label_ids, computed):
@@ -301,6 +302,6 @@ def boundaries_to_geometries(
         if simplify and tolerance > 0:
             geom = geom.simplify(tolerance, preserve_topology=True)
         if isinstance(geom, Polygon) and not geom.is_empty:
-            geoms[int(label_id)] = geom
+            geoms[cast(int, label_id)] = geom
     logger.debug("Extracted %d geometries from boundaries GeoDataFrame", len(geoms))
     return geoms

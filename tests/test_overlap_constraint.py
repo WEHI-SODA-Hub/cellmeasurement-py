@@ -130,3 +130,71 @@ def test_write_geojson_can_disable_overlap_constraint(tmp_path: Path):
 
     assert len(constrained["features"]) == 2  # annotation + 1 cell
     assert len(unconstrained["features"]) == 3  # annotation + 2 cells
+
+
+def test_write_geojson_attaches_measurements(tmp_path: Path):
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=11,
+        whole_cell_label=21,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=1,
+        cell_area_px=4,
+        overlap_px=1,
+        overlap_fraction=1.0,
+        match_source="overlap_1to1",
+    )
+    out_path = tmp_path / "with_measurements.geojson"
+
+    write_geojson(
+        cells=[cell],
+        nuc_geoms={11: Polygon([(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)])},
+        wc_geoms={21: Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])},
+        synth_geoms={},
+        output_path=out_path,
+        image_shape=(10, 10),
+        measurements_by_cell={1: {"Cell: Area px": 4.0}},
+        constrain_overlaps=False,
+    )
+
+    with out_path.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    cell_feature = next(feat for feat in data["features"] if feat["properties"].get("objectType") == "cell")
+    assert cell_feature["properties"]["measurements"]["Cell: Area px"] == 4.0
+
+
+def test_write_geojson_attaches_measurements_from_jsonl(tmp_path: Path):
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=11,
+        whole_cell_label=21,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=1,
+        cell_area_px=4,
+        overlap_px=1,
+        overlap_fraction=1.0,
+        match_source="overlap_1to1",
+    )
+    out_path = tmp_path / "with_measurements_jsonl.geojson"
+    jsonl_path = tmp_path / "measurements.jsonl"
+    jsonl_path.write_text('{"cell_id":1,"measurements":{"Cell: Area px":4.0}}\n', encoding="utf-8")
+
+    write_geojson(
+        cells=[cell],
+        nuc_geoms={11: Polygon([(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)])},
+        wc_geoms={21: Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])},
+        synth_geoms={},
+        output_path=out_path,
+        image_shape=(10, 10),
+        measurements_jsonl_path=jsonl_path,
+        constrain_overlaps=False,
+    )
+
+    with out_path.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    cell_feature = next(feat for feat in data["features"] if feat["properties"].get("objectType") == "cell")
+    assert cell_feature["properties"]["measurements"]["Cell: Area px"] == 4.0

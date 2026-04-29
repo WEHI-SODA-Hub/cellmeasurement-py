@@ -87,6 +87,7 @@ def _cell_to_feature(
     nuc_geoms: dict[int, Polygon] | None,
     wc_geoms: dict[int, Polygon] | None,
     synth_geoms: SynthGeoms,
+    measurements: dict[str, float] | None = None,
 ) -> dict | None:
     """Build a GeoJSON Feature dict for a single cell.
 
@@ -108,6 +109,8 @@ def _cell_to_feature(
             "match_source": cell.match_source,
         },
     }
+    if measurements is not None:
+        feature["properties"]["measurements"] = measurements
     if nuc_geom is not None:
         feature["nucleusGeometry"] = mapping(nuc_geom)
 
@@ -121,6 +124,8 @@ def write_geojson(
     synth_geoms: SynthGeoms,
     output_path: Path,
     image_shape: tuple[int, int],
+    measurements_by_cell: dict[int, dict[str, float]] | None = None,
+    measurements_jsonl_path: Path | None = None,
     constrain_overlaps: bool = True,
     pretty: bool = False,
 ) -> int:
@@ -147,6 +152,11 @@ def write_geojson(
         output_path: Destination ``.geojson`` file path.
         image_shape: ``(height, width)`` of the full image; used to build the
             annotation bounding-box feature.
+        measurements_by_cell: Optional mapping of ``cell_id`` to precomputed
+            measurement key/value pairs to attach under
+            ``feature.properties.measurements``.
+        measurements_jsonl_path: Optional JSONL path with one record per line:
+            ``{"cell_id": int, "measurements": {...}}``.
         constrain_overlaps: Whether to run overlap clipping so no two cell
             polygons share area.
         pretty: Write indented (human-readable) JSON.
@@ -167,9 +177,45 @@ def write_geojson(
         },
     }
 
+    if measurements_by_cell is not None and measurements_jsonl_path is not None:
+        raise ValueError("Provide either measurements_by_cell or measurements_jsonl_path, not both.")
+
+    def _iter_measurements_jsonl(path: Path):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                cell_id = int(rec["cell_id"])
+                measurements = rec.get("measurements", {})
+                yield cell_id, measurements if isinstance(measurements, dict) else {}
+
+    jsonl_iter = None
+    jsonl_current = None
+    if measurements_jsonl_path is not None and measurements_jsonl_path.exists():
+        jsonl_iter = _iter_measurements_jsonl(measurements_jsonl_path)
+        jsonl_current = next(jsonl_iter, None)
+
     features: list[dict] = []
-    for cell in cells:
-        feat = _cell_to_feature(cell, nuc_geoms, wc_geoms, synth_geoms)
+    for cell in sorted(cells, key=lambda c: c.cell_id):
+        cell_measurements: dict[str, float] | None = None
+        if measurements_by_cell is not None:
+            cell_measurements = measurements_by_cell.get(cell.cell_id)
+        elif jsonl_iter is not None:
+            while jsonl_current is not None and jsonl_current[0] < cell.cell_id:
+                jsonl_current = next(jsonl_iter, None)
+            if jsonl_current is not None and jsonl_current[0] == cell.cell_id:
+                cell_measurements = jsonl_current[1]
+                jsonl_current = next(jsonl_iter, None)
+
+        feat = _cell_to_feature(
+            cell,
+            nuc_geoms,
+            wc_geoms,
+            synth_geoms,
+            measurements=cell_measurements,
+        )
         if feat is not None:
             features.append(feat)
 
