@@ -124,9 +124,9 @@ def main(
         bool,
         typer.Option(
             "--measurements/--no-measurements",
-            help="Enable intensity/erosion/shape measurements (default: disabled).",
+            help="Enable intensity/erosion/shape measurements (default: enabled).",
         ),
-    ] = False,
+    ] = True,
     tiff_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -145,6 +145,29 @@ def main(
             )
         ),
     ] = "",
+    erosion_steps: Annotated[
+        bool,
+        typer.Option(
+            "--erosion-steps/--no-erosion-steps",
+            help="Enable/disable equal-area erosion-bin measurements.",
+        ),
+    ] = True,
+    expansion_steps: Annotated[
+        bool,
+        typer.Option(
+            "--expansion-steps/--no-expansion-steps",
+            help="Enable/disable equal-area 20um expansion-bin measurements.",
+        ),
+    ] = True,
+    pixel_size_microns: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Pixel size in microns, used for 20um expansion conversion "
+                "and µm-scaled shape measurements."
+            )
+        ),
+    ] = 0.5,
     tile_size: Annotated[
         int,
         typer.Option(help="Tile size in pixels for batched measurement image reads."),
@@ -196,6 +219,9 @@ def main(
         raise typer.Exit(code=1)
     if threads <= 0:
         typer.echo("Error: --threads must be > 0.", err=True)
+        raise typer.Exit(code=1)
+    if pixel_size_microns <= 0:
+        typer.echo("Error: --pixel-size-microns must be > 0.", err=True)
         raise typer.Exit(code=1)
 
     nuc_mask: SegmentationMask | None = None
@@ -250,6 +276,9 @@ def main(
                     tile_size=tile_size,
                     tile_overlap=tile_overlap,
                     threads=threads,
+                    erosion_enabled=erosion_steps,
+                    expansion_enabled=expansion_steps,
+                    pixel_size_microns=pixel_size_microns,
                     jsonl_path=measurements_jsonl_path,
                     return_results=False,
                 )

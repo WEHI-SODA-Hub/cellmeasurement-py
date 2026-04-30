@@ -198,33 +198,45 @@ def _axis_minor_length(region: object) -> float:
     return float(getattr(region, "minor_axis_length"))
 
 
-def _basic_shape_metrics(cell_mask: np.ndarray, nuc_mask: np.ndarray) -> dict[str, float]:
+def _basic_shape_metrics(
+    cell_mask: np.ndarray,
+    nuc_mask: np.ndarray,
+    pixel_size_microns: float,
+) -> dict[str, float]:
     """Compute cell/nucleus shape metrics from binary masks."""
     r = _largest_region(cell_mask)
     if r is None:
         return {}
 
+    px_to_um = float(pixel_size_microns)
+    area_scale = px_to_um**2
     perimeter = float(r.perimeter) if r.perimeter > 0 else 0.0
     circularity = float(4 * math.pi * r.area / (r.perimeter**2)) if r.perimeter > 0 else 0.0
+    major_px = _axis_major_length(r)
+    minor_px = _axis_minor_length(r)
+    cell_area_px = float(r.area)
     out: dict[str, float] = {
-        "Cell: Area px": float(r.area),
+        "Cell: Area µm^2": cell_area_px * area_scale,
         "Cell: Circularity": circularity,
-        "Cell: Length px": perimeter,
-        "Cell: Max diameter px": _axis_major_length(r),
-        "Cell: Min diameter px": _axis_minor_length(r),
+        "Cell: Length µm": perimeter * px_to_um,
+        "Cell: Max diameter µm": major_px * px_to_um,
+        "Cell: Min diameter µm": minor_px * px_to_um,
         "Cell: Solidity": float(r.solidity) if r.solidity is not None else 0.0,
     }
 
     nr = _largest_region(nuc_mask)
     if nr is not None:
-        n_area = float(nr.area)
-        out["Nucleus: Area px"] = n_area
+        n_area_px = float(nr.area)
+        n_perimeter_px = float(nr.perimeter) if nr.perimeter > 0 else 0.0
+        n_major_px = _axis_major_length(nr)
+        n_minor_px = _axis_minor_length(nr)
+        out["Nucleus: Area µm^2"] = n_area_px * area_scale
         out["Nucleus: Circularity"] = float(4 * math.pi * nr.area / (nr.perimeter**2)) if nr.perimeter > 0 else 0.0
-        out["Nucleus: Length px"] = float(nr.perimeter) if nr.perimeter > 0 else 0.0
-        out["Nucleus: Max diameter px"] = _axis_major_length(nr)
-        out["Nucleus: Min diameter px"] = _axis_minor_length(nr)
+        out["Nucleus: Length µm"] = n_perimeter_px * px_to_um
+        out["Nucleus: Max diameter µm"] = n_major_px * px_to_um
+        out["Nucleus: Min diameter µm"] = n_minor_px * px_to_um
         out["Nucleus: Solidity"] = float(nr.solidity) if nr.solidity is not None else 0.0
-        out["Nucleus/Cell area ratio"] = n_area / float(r.area) if r.area > 0 else 0.0
+        out["Nucleus/Cell area ratio"] = n_area_px / cell_area_px if cell_area_px > 0 else 0.0
 
     return out
 
@@ -359,6 +371,84 @@ def _add_erosion_measurements(
             prev_mask = eroded_mask
 
 
+def _expansion_bins_for_mask(
+    cell_mask: np.ndarray,
+    total_expansion_px: int,
+    n_bins: int = 5,
+) -> list[tuple[np.ndarray, int]]:
+    """Compute cumulative expansion boundaries splitting the 20 µm zone into equal-area bins."""
+    cm = cell_mask.astype(bool)
+    if not np.any(cm):
+        return []
+
+    full_dilated = ndi.binary_dilation(cm, structure=_DISK_1, iterations=total_expansion_px)
+    zone = full_dilated & ~cm
+    total_zone_area = int(np.count_nonzero(zone))
+    if total_zone_area == 0:
+        return []
+
+    target_fractions = [(b / n_bins) for b in range(1, n_bins + 1)]
+    bins: list[tuple[np.ndarray, int]] = []
+
+    current = cm.copy()
+    depth = 0
+    for target_frac in target_fractions:
+        target_area = int(total_zone_area * target_frac)
+        while depth < total_expansion_px:
+            current_ring_area = int(np.count_nonzero(current & ~cm))
+            if current_ring_area >= target_area:
+                break
+            current = ndi.binary_dilation(current, structure=_DISK_1, iterations=1)
+            depth += 1
+        bins.append((current.copy(), depth))
+        if depth >= total_expansion_px:
+            while len(bins) < n_bins:
+                bins.append((current.copy(), depth))
+            break
+
+    return bins
+
+
+def _add_expansion_measurements(
+    props: dict[str, float],
+    image_cyx: np.ndarray,
+    ch_names: Sequence[str],
+    cell_mask: np.ndarray,
+    pixel_size_microns: float,
+    n_bins: int = 5,
+) -> None:
+    """Populate per-bin expansion area/depth and channel intensity measurements."""
+    expansion_um = 20.0
+    total_expansion_px = max(1, int(round(expansion_um / pixel_size_microns)))
+
+    cm = cell_mask.astype(bool)
+    base_area = int(np.count_nonzero(cm))
+    if base_area == 0:
+        return
+
+    bin_boundaries = _expansion_bins_for_mask(cm, total_expansion_px, n_bins=n_bins)
+    if not bin_boundaries:
+        return
+
+    prev_mask = cm.copy()
+    for bin_idx, (dilated_mask, depth_px) in enumerate(bin_boundaries, start=1):
+        ring = dilated_mask & ~prev_mask
+        ring_area = int(np.count_nonzero(ring))
+
+        props[f"Cell: ExpansionBin_{bin_idx}: Area_px"] = float(ring_area)
+        props[f"Cell: ExpansionBin_{bin_idx}: Area_Fraction"] = float(ring_area / base_area)
+        props[f"Cell: ExpansionBin_{bin_idx}: Depth_px"] = float(depth_px)
+
+        if ring_area > 0:
+            for ci, ch in enumerate(ch_names):
+                vals = image_cyx[ci][ring]
+                if vals.size > 0:
+                    props[f"{ch}: Cell: ExpansionBin_{bin_idx}: Mean"] = float(np.mean(vals))
+                    props[f"{ch}: Cell: ExpansionBin_{bin_idx}: Median"] = float(np.median(vals))
+
+        prev_mask = dilated_mask
+
+
 def _polygon_to_local_mask(poly: Polygon, bbox: tuple[int, int, int, int]) -> np.ndarray:
     """Rasterize a global polygon into a local bbox mask."""
     r0, c0, r1, c1 = bbox
@@ -440,9 +530,16 @@ def _measure_single_cell(
     nuc_crop: np.ndarray | None,
     wc_crop: np.ndarray | None,
     bbox: tuple[int, int, int, int],
+    expansion_image_crop: np.ndarray | None,
+    expansion_nuc_crop: np.ndarray | None,
+    expansion_wc_crop: np.ndarray | None,
+    expansion_bbox: tuple[int, int, int, int] | None,
     synth_geoms: dict[int, Polygon],
     percentiles: Sequence[float],
     ch_names: Sequence[str],
+    erosion_enabled: bool,
+    expansion_enabled: bool,
+    pixel_size_microns: float,
 ) -> dict[str, float]:
     """Compute all measurement families for a single cell crop."""
     cell_mask, nuc_mask = _cell_masks_from_crops(cell, nuc_crop, wc_crop, synth_geoms, bbox)
@@ -450,11 +547,28 @@ def _measure_single_cell(
         return {}
 
     measurements: dict[str, float] = {}
-    measurements.update(_basic_shape_metrics(cell_mask, nuc_mask))
+    measurements.update(_basic_shape_metrics(cell_mask, nuc_mask, pixel_size_microns=pixel_size_microns))
     comps = _compartment_masks(cell_mask, nuc_mask)
     _add_intensity_measurements(measurements, image_crop, ch_names, comps)
     _add_percentiles(measurements, image_crop, ch_names, comps, percentiles)
-    _add_erosion_measurements(measurements, image_crop, ch_names, comps, n_bins=5)
+    if erosion_enabled:
+        _add_erosion_measurements(measurements, image_crop, ch_names, comps, n_bins=5)
+    if expansion_enabled and expansion_image_crop is not None and expansion_bbox is not None:
+        expansion_cell_mask, _ = _cell_masks_from_crops(
+            cell,
+            expansion_nuc_crop,
+            expansion_wc_crop,
+            synth_geoms,
+            expansion_bbox,
+        )
+        _add_expansion_measurements(
+            measurements,
+            expansion_image_crop,
+            ch_names,
+            expansion_cell_mask,
+            pixel_size_microns=pixel_size_microns,
+            n_bins=5,
+        )
     return measurements
 
 
@@ -470,6 +584,9 @@ def _measure_tile(
     tile_overlap: int,
     synth_geoms: dict[int, Polygon],
     percentiles: Sequence[float],
+    erosion_enabled: bool,
+    expansion_enabled: bool,
+    pixel_size_microns: float,
 ) -> tuple[dict[int, dict[str, float]], int]:
     """Measure all cells owned by a single tile and count fallback reads."""
     H, W = image_shape
@@ -504,15 +621,48 @@ def _measure_tile(
             wc_crop = wc_tile[sr0:sr1, sc0:sc1] if wc_tile is not None else None
             bbox = (br0, bc0, br1, bc1)
 
+        expansion_image_crop: np.ndarray | None = None
+        expansion_nuc_crop: np.ndarray | None = None
+        expansion_wc_crop: np.ndarray | None = None
+        expansion_bbox: tuple[int, int, int, int] | None = None
+        if expansion_enabled:
+            pad_px = max(1, int(round(20.0 / pixel_size_microns)))
+            er0 = max(0, br0 - pad_px)
+            ec0 = max(0, bc0 - pad_px)
+            er1 = min(H, br1 + pad_px)
+            ec1 = min(W, bc1 + pad_px)
+            expansion_bbox = (er0, ec0, er1, ec1)
+            expansion_outside_tile = er0 < r0 or ec0 < c0 or er1 > r1 or ec1 > c1
+            if expansion_outside_tile:
+                fallback_reads += 1
+                expansion_image_crop = image_cyx[:, er0:er1, ec0:ec1]
+                expansion_nuc_crop = _slice_or_compute(nuc_labels, er0, er1, ec0, ec1)
+                expansion_wc_crop = _slice_or_compute(wc_labels, er0, er1, ec0, ec1)
+            else:
+                esr0 = er0 - r0
+                esc0 = ec0 - c0
+                esr1 = er1 - r0
+                esc1 = ec1 - c0
+                expansion_image_crop = image_tile[:, esr0:esr1, esc0:esc1]
+                expansion_nuc_crop = nuc_tile[esr0:esr1, esc0:esc1] if nuc_tile is not None else None
+                expansion_wc_crop = wc_tile[esr0:esr1, esc0:esc1] if wc_tile is not None else None
+
         measurement = _measure_single_cell(
             cell=cell,
             image_crop=image_crop,
             nuc_crop=nuc_crop,
             wc_crop=wc_crop,
             bbox=bbox,
+            expansion_image_crop=expansion_image_crop,
+            expansion_nuc_crop=expansion_nuc_crop,
+            expansion_wc_crop=expansion_wc_crop,
+            expansion_bbox=expansion_bbox,
             synth_geoms=synth_geoms,
             percentiles=percentiles,
             ch_names=ch_names,
+            erosion_enabled=erosion_enabled,
+            expansion_enabled=expansion_enabled,
+            pixel_size_microns=pixel_size_microns,
         )
         results[cell.cell_id] = measurement
 
@@ -540,6 +690,9 @@ def measure_cells_tiled(
     tile_size: int = 2048,
     tile_overlap: int = 200,
     threads: int = 1,
+    erosion_enabled: bool = True,
+    expansion_enabled: bool = True,
+    pixel_size_microns: float = 0.5,
     jsonl_path: Path | None = None,
     return_results: bool = True,
 ) -> dict[int, dict[str, float]]:
@@ -573,6 +726,13 @@ def measure_cells_tiled(
         Extra pixels added around each tile read window.
     threads:
         Number of tile workers. Values ``<=1`` run serially.
+    erosion_enabled:
+        Whether to compute equal-area erosion-bin measurements.
+    expansion_enabled:
+        Whether to compute equal-area expansion-bin measurements.
+    pixel_size_microns:
+        Pixel size used for converting the fixed 20 µm expansion radius to pixels
+        and for µm-scaled shape metrics.
     jsonl_path:
         Optional output path for streamed JSONL rows shaped as
         ``{"cell_id": int, "measurements": {...}}``.
@@ -636,6 +796,9 @@ def measure_cells_tiled(
                     tile_overlap=tile_overlap,
                     synth_geoms=synth_geoms,
                     percentiles=percentiles,
+                    erosion_enabled=erosion_enabled,
+                    expansion_enabled=expansion_enabled,
+                    pixel_size_microns=pixel_size_microns,
                 )
                 if return_results:
                     results.update(tile_result)
@@ -657,6 +820,9 @@ def measure_cells_tiled(
                         tile_overlap,
                         synth_geoms,
                         percentiles,
+                        erosion_enabled,
+                        expansion_enabled,
+                        pixel_size_microns,
                     ): key
                     for key, group in tile_groups.items()
                 }

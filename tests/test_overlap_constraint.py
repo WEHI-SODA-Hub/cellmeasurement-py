@@ -154,7 +154,7 @@ def test_write_geojson_attaches_measurements(tmp_path: Path):
         synth_geoms={},
         output_path=out_path,
         image_shape=(10, 10),
-        measurements_by_cell={1: {"Cell: Area px": 4.0}},
+        measurements_by_cell={1: {"Cell: Area µm^2": 4.0}},
         constrain_overlaps=False,
     )
 
@@ -162,7 +162,7 @@ def test_write_geojson_attaches_measurements(tmp_path: Path):
         data = json.load(f)
 
     cell_feature = next(feat for feat in data["features"] if feat["properties"].get("objectType") == "cell")
-    assert cell_feature["properties"]["measurements"]["Cell: Area px"] == 4.0
+    assert cell_feature["properties"]["measurements"]["Cell: Area µm^2"] == 4.0
 
 
 def test_write_geojson_attaches_measurements_from_jsonl(tmp_path: Path):
@@ -180,7 +180,7 @@ def test_write_geojson_attaches_measurements_from_jsonl(tmp_path: Path):
     )
     out_path = tmp_path / "with_measurements_jsonl.geojson"
     jsonl_path = tmp_path / "measurements.jsonl"
-    jsonl_path.write_text('{"cell_id":1,"measurements":{"Cell: Area px":4.0}}\n', encoding="utf-8")
+    jsonl_path.write_text('{"cell_id":1,"measurements":{"Cell: Area µm^2":4.0}}\n', encoding="utf-8")
 
     write_geojson(
         cells=[cell],
@@ -197,4 +197,4 @@ def test_write_geojson_attaches_measurements_from_jsonl(tmp_path: Path):
         data = json.load(f)
 
     cell_feature = next(feat for feat in data["features"] if feat["properties"].get("objectType") == "cell")
-    assert cell_feature["properties"]["measurements"]["Cell: Area px"] == 4.0
+    assert cell_feature["properties"]["measurements"]["Cell: Area µm^2"] == 4.0
