@@ -164,3 +164,49 @@ def test_measure_cells_tiled_streams_jsonl(tmp_path: Path):
     lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert '"cell_id":1' in lines[0]
+
+
+def test_measure_cells_tiled_uses_tiff_channel_names(tmp_path: Path):
+    img = np.zeros((2, 5, 5), dtype=np.uint16)  # (C, Y, X)
+    img[0, 1:4, 1:4] = 7
+    img[1, 1:4, 1:4] = 11
+    tiff_path = tmp_path / "img_channels.ome.tiff"
+    tifffile.imwrite(
+        tiff_path,
+        img,
+        metadata={"axes": "CYX", "Channel": {"Name": ["DAPI", "CD3"]}},
+    )
+
+    wc = np.zeros((5, 5), dtype=np.uint32)
+    wc[1:4, 1:4] = 1
+    nuc = np.zeros((5, 5), dtype=np.uint32)
+    nuc[2:3, 2:3] = 1
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=1,
+        whole_cell_label=1,
+        bbox=(1, 1, 4, 4),
+        centroid=(2.0, 2.0),
+        nucleus_area_px=1,
+        cell_area_px=9,
+        overlap_px=1,
+        overlap_fraction=1.0,
+        match_source="overlap_1to1",
+    )
+
+    measured = measure_cells_tiled(
+        cells=[cell],
+        nuc_labels=da.from_array(nuc, chunks=(5, 5)),
+        wc_labels=da.from_array(wc, chunks=(5, 5)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(5, 5),
+        tile_size=5,
+        tile_overlap=0,
+        threads=1,
+    )
+
+    props = measured[1]
+    assert "DAPI: Cell: Mean" in props
+    assert "CD3: Cell: Mean" in props

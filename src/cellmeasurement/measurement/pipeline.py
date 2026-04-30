@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -74,10 +75,12 @@ def _normalize_image_cyx(arr: np.ndarray, axes: str | None = None) -> np.ndarray
 def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
     """Load TIFF intensity image and return (C, Y, X) data with channel names."""
     axes: str | None = None
+    ch_names: list[str] = []
     try:
         with tifffile.TiffFile(path) as tf:
             if tf.series:
                 axes = tf.series[0].axes
+            ch_names = _extract_channel_names(tf)
     except Exception:
         axes = None
 
@@ -91,8 +94,86 @@ def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
         arr = tifffile.imread(path)
 
     image_cyx = _normalize_image_cyx(np.asarray(arr), axes=axes)
-    ch_names = [f"Channel {i + 1}" for i in range(int(image_cyx.shape[0]))]
+    n_channels = int(image_cyx.shape[0])
+    if not ch_names or len(ch_names) != n_channels:
+        if ch_names and len(ch_names) != n_channels:
+            logger.warning(
+                "Found %d channel names but TIFF has %d channels; using fallback names.",
+                len(ch_names),
+                n_channels,
+            )
+        ch_names = [f"Channel {i + 1}" for i in range(n_channels)]
     return image_cyx, ch_names
+
+
+def _channel_names_from_ome(tf: tifffile.TiffFile) -> list[str]:
+    """Extract channel names from OME-XML metadata when available."""
+    ome_text = tf.ome_metadata
+    if not ome_text and tf.pages:
+        first_desc = tf.pages[0].description
+        if isinstance(first_desc, str) and first_desc.strip().startswith("<"):
+            ome_text = first_desc
+    if not ome_text:
+        return []
+
+    root = ET.fromstring(ome_text)
+    ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+    channels = root.findall(".//ome:Channel", ns)
+    out = []
+    for ch in channels:
+        name = ch.get("Name") or ch.get("ID") or ""
+        out.append(str(name))
+    return [name for name in out if name]
+
+
+def _channel_names_from_mibi_json(tf: tifffile.TiffFile) -> list[str]:
+    """Extract channel names from per-page MIBI JSON descriptions."""
+    if not tf.pages:
+        return []
+    try:
+        first_desc = tf.pages[0].description
+        if not isinstance(first_desc, str):
+            return []
+        json.loads(first_desc)  # probe JSON format
+        out: list[str] = []
+        for page in tf.pages:
+            desc = page.description
+            if not isinstance(desc, str):
+                return []
+            parsed = json.loads(desc)
+            name = parsed.get("channel.target", "")
+            out.append(str(name))
+        return [name for name in out if name]
+    except (ValueError, TypeError, AttributeError):
+        return []
+
+
+def _channel_names_from_imagej(tf: tifffile.TiffFile) -> list[str]:
+    """Extract channel names from ImageJ Labels metadata."""
+    ij = tf.imagej_metadata
+    if not ij or "Labels" not in ij:
+        return []
+    return [str(lbl) for lbl in ij["Labels"] if str(lbl)]
+
+
+def _extract_channel_names(tf: tifffile.TiffFile) -> list[str]:
+    """Extract channel names using OME, MIBI JSON, then ImageJ metadata strategies."""
+    try:
+        names = _channel_names_from_ome(tf)
+        if names:
+            return names
+    except Exception as exc:
+        logger.debug("Failed OME channel extraction: %s", exc)
+
+    names = _channel_names_from_mibi_json(tf)
+    if names:
+        return names
+
+    names = _channel_names_from_imagej(tf)
+    if names:
+        return names
+
+    return []
 
 
 def _largest_region(mask: np.ndarray):
@@ -361,6 +442,7 @@ def _measure_single_cell(
     bbox: tuple[int, int, int, int],
     synth_geoms: dict[int, Polygon],
     percentiles: Sequence[float],
+    ch_names: Sequence[str],
 ) -> dict[str, float]:
     """Compute all measurement families for a single cell crop."""
     cell_mask, nuc_mask = _cell_masks_from_crops(cell, nuc_crop, wc_crop, synth_geoms, bbox)
@@ -370,10 +452,9 @@ def _measure_single_cell(
     measurements: dict[str, float] = {}
     measurements.update(_basic_shape_metrics(cell_mask, nuc_mask))
     comps = _compartment_masks(cell_mask, nuc_mask)
-    channel_names = [f"Channel {i + 1}" for i in range(int(image_crop.shape[0]))]
-    _add_intensity_measurements(measurements, image_crop, channel_names, comps)
-    _add_percentiles(measurements, image_crop, channel_names, comps, percentiles)
-    _add_erosion_measurements(measurements, image_crop, channel_names, comps, n_bins=5)
+    _add_intensity_measurements(measurements, image_crop, ch_names, comps)
+    _add_percentiles(measurements, image_crop, ch_names, comps, percentiles)
+    _add_erosion_measurements(measurements, image_crop, ch_names, comps, n_bins=5)
     return measurements
 
 
@@ -381,6 +462,7 @@ def _measure_tile(
     tile_key: tuple[int, int],
     tile_cells: Sequence[CellMatch],
     image_cyx: np.ndarray,
+    ch_names: Sequence[str],
     nuc_labels: da.Array | None,
     wc_labels: da.Array | None,
     image_shape: tuple[int, int],
@@ -430,6 +512,7 @@ def _measure_tile(
             bbox=bbox,
             synth_geoms=synth_geoms,
             percentiles=percentiles,
+            ch_names=ch_names,
         )
         results[cell.cell_id] = measurement
 
@@ -512,7 +595,7 @@ def measure_cells_tiled(
     if not cells:
         return {}
 
-    image_cyx, _ = _load_tiff_image(tiff_file)
+    image_cyx, ch_names = _load_tiff_image(tiff_file)
     if image_cyx.shape[1:] != image_shape:
         raise ValueError(
             f"TIFF image shape {tuple(image_cyx.shape[1:])} does not match segmentation shape {image_shape}."
@@ -545,6 +628,7 @@ def measure_cells_tiled(
                     tile_key=key,
                     tile_cells=group,
                     image_cyx=image_cyx,
+                    ch_names=ch_names,
                     nuc_labels=nuc_labels,
                     wc_labels=wc_labels,
                     image_shape=image_shape,
@@ -565,6 +649,7 @@ def measure_cells_tiled(
                         key,
                         group,
                         image_cyx,
+                        ch_names,
                         nuc_labels,
                         wc_labels,
                         image_shape,
