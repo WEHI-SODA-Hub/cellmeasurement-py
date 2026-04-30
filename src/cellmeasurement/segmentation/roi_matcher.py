@@ -34,6 +34,7 @@ import dask.array as da
 import numpy as np
 import numpy.typing as npt
 from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
 from shapely.geometry import Polygon
 from skimage.morphology import disk
 from skimage.segmentation import watershed
@@ -65,7 +66,8 @@ __all__ = ["match_rois"]
 def match_rois(
     nuc_labels: da.Array | None,
     wc_labels: da.Array | None,
-    synthesis_dist: float = 3.0,
+    dist_threshold: float = 10.0,
+    estimate_cell_boundary_dist: float = 3.0,
 ) -> tuple[list[CellMatch], dict[CellId, Polygon]]:
     """Match nuclear ROIs to whole-cell ROIs and return a list of cells.
 
@@ -84,7 +86,9 @@ def match_rois(
             ``None`` for whole-cell-only mode.
         wc_labels: 2-D dask label array for the whole-cell segmentation, or
             ``None`` for nuclear-only mode.
-        synthesis_dist: Radius in pixels for watershed expansion of unmatched
+        dist_threshold: Maximum centroid distance (pixels) used for secondary
+            nearest-neighbour matching after overlap assignment.
+        estimate_cell_boundary_dist: Radius in pixels for watershed expansion of unmatched
             nuclei.  Ignored in single-mask modes.
 
     Returns:
@@ -100,6 +104,8 @@ def match_rois(
     """
     if nuc_labels is None and wc_labels is None:
         raise ValueError("At least one of nuc_labels or wc_labels must be provided.")
+    if dist_threshold <= 0:
+        raise ValueError("dist_threshold must be > 0")
 
     if nuc_labels is None:
         assert wc_labels is not None
@@ -155,10 +161,34 @@ def match_rois(
         len(wc_stats) - len(matched_wc),
     )
 
+    dist_matches, matched_nuc, matched_wc, next_id = _resolve_distance_threshold(
+        nuc_stats=nuc_stats,
+        wc_stats=wc_stats,
+        matched_nuc=matched_nuc,
+        matched_wc=matched_wc,
+        next_id=next_id,
+        dist_threshold=dist_threshold,
+    )
+    if dist_matches:
+        matches.extend(dist_matches)
+        logger.info(
+            "Distance-threshold matched %d additional pairs (<= %.2f px)",
+            len(dist_matches),
+            dist_threshold,
+        )
+
     # --- Synthesis for unmatched nuclei ---
     unmatched_nuc = set(nuc_stats.keys()) - matched_nuc
     synth, synth_geoms, _ = _synthesis_pass(
-        unmatched_nuc, matched_wc, nuc_labels, wc_labels, nuc_stats, synthesis_dist, H, W, next_id
+        unmatched_nuc,
+        matched_wc,
+        nuc_labels,
+        wc_labels,
+        nuc_stats,
+        estimate_cell_boundary_dist,
+        H,
+        W,
+        next_id,
     )
     logger.info("Synthesised boundaries for %d unmatched nuclei", len(synth))
 
@@ -428,6 +458,83 @@ def _resolve_one_to_one(
     return matches, matched_nuc, matched_wc, next_id
 
 
+def _centroid_from_stats(stats: LabelStats) -> tuple[float, float]:
+    """Compute centroid (row, col) from aggregated label stats."""
+    return (stats["row_sum"] / stats["area"], stats["col_sum"] / stats["area"])
+
+
+def _resolve_distance_threshold(
+    nuc_stats: LabelStatsById,
+    wc_stats: LabelStatsById,
+    matched_nuc: set[LabelId],
+    matched_wc: set[LabelId],
+    next_id: int,
+    dist_threshold: float,
+) -> tuple[list[CellMatch], set[LabelId], set[LabelId], int]:
+    """Match unmatched nuclei to nearest unmatched whole-cell centroids within threshold."""
+    unmatched_nuc = sorted(set(nuc_stats.keys()) - matched_nuc)
+    candidate_wc = sorted(set(wc_stats.keys()) - matched_wc)
+    if not unmatched_nuc or not candidate_wc:
+        return [], matched_nuc, matched_wc, next_id
+
+    wc_points = np.array([_centroid_from_stats(wc_stats[wid]) for wid in candidate_wc], dtype=np.float64)
+    tree = cKDTree(wc_points)
+
+    matches: list[CellMatch] = []
+    for nuc_id in unmatched_nuc:
+        ns = nuc_stats[nuc_id]
+        nuc_point = np.array(_centroid_from_stats(ns), dtype=np.float64)
+        idxs = tree.query_ball_point(nuc_point, r=dist_threshold)
+        if not idxs:
+            continue
+
+        best_wc: LabelId | None = None
+        best_dist_sq = float("inf")
+        for idx in idxs:
+            wc_id = candidate_wc[int(idx)]
+            if wc_id in matched_wc:
+                continue
+            ws = wc_stats[wc_id]
+            wr, wc = _centroid_from_stats(ws)
+            dr = nuc_point[0] - wr
+            dc = nuc_point[1] - wc
+            dist_sq = float(dr * dr + dc * dc)
+            if dist_sq < best_dist_sq or (dist_sq == best_dist_sq and (best_wc is None or wc_id < best_wc)):
+                best_dist_sq = dist_sq
+                best_wc = wc_id
+
+        if best_wc is None:
+            continue
+
+        ws = wc_stats[best_wc]
+        matched_nuc.add(nuc_id)
+        matched_wc.add(best_wc)
+
+        row_min = min(ns["row_min"], ws["row_min"])
+        col_min = min(ns["col_min"], ws["col_min"])
+        row_max_excl = max(ns["row_max"], ws["row_max"]) + 1
+        col_max_excl = max(ns["col_max"], ws["col_max"]) + 1
+        centroid = _centroid_from_stats(ws)
+
+        matches.append(
+            CellMatch(
+                cell_id=next_id,
+                nucleus_label=nuc_id,
+                whole_cell_label=best_wc,
+                bbox=(row_min, col_min, row_max_excl, col_max_excl),
+                centroid=centroid,
+                nucleus_area_px=ns["area"],
+                cell_area_px=ws["area"],
+                overlap_px=0,
+                overlap_fraction=0.0,
+                match_source="overlap_1to1",
+            )
+        )
+        next_id += 1
+
+    return matches, matched_nuc, matched_wc, next_id
+
+
 # ---------------------------------------------------------------------------
 # Watershed synthesis for unmatched nuclei
 # ---------------------------------------------------------------------------
@@ -439,7 +546,7 @@ def _synthesis_pass(
     nuc_labels: da.Array,
     wc_labels: da.Array,
     nuc_stats: LabelStatsById,
-    synthesis_dist: float,
+    estimate_cell_boundary_dist: float,
     H: int,
     W: int,
     next_id: int,
@@ -447,7 +554,7 @@ def _synthesis_pass(
     """Synthesise whole-cell boundaries for unmatched nuclei via watershed.
 
     Nuclei are expanded into pixels not already claimed by a matched whole-cell
-    label, up to *synthesis_dist* pixels from the nucleus border.  Polygon
+    label, up to *estimate_cell_boundary_dist* pixels from the nucleus border.  Polygon
     geometry is extracted immediately per cell and the watershed arrays are
     explicitly freed afterwards to minimise peak RSS.
 
@@ -460,7 +567,7 @@ def _synthesis_pass(
     if not unmatched_nuc_ids:
         return [], {}, next_id
 
-    pad = max(1, int(np.ceil(synthesis_dist)))
+    pad = max(1, int(np.ceil(estimate_cell_boundary_dist)))
     all_row_min = min(nuc_stats[n]["row_min"] for n in unmatched_nuc_ids)
     all_row_max = max(nuc_stats[n]["row_max"] for n in unmatched_nuc_ids)
     all_col_min = min(nuc_stats[n]["col_min"] for n in unmatched_nuc_ids)
@@ -486,8 +593,10 @@ def _synthesis_pass(
     for local_id, (nuc_id, _) in enumerate(local_map, start=1):
         seeds[nuc_region == nuc_id] = local_id
 
-    # Growth zone: within synthesis_dist of any seed, excluding matched wc pixels.
-    growth_zone = ndi.binary_dilation(seeds > 0, structure=disk(max(1, int(synthesis_dist))))
+    # Growth zone: within estimate_cell_boundary_dist of any seed, excluding matched wc pixels.
+    growth_zone = ndi.binary_dilation(
+        seeds > 0, structure=disk(max(1, int(estimate_cell_boundary_dist)))
+    )
     assert growth_zone.dtype == bool
     if matched_wc_ids:
         claimed: npt.NDArray[np.bool_] = np.isin(wc_region, list(matched_wc_ids))

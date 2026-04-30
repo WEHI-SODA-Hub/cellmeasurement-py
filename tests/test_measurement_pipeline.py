@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import dask.array as da
 import numpy as np
@@ -259,3 +260,164 @@ def test_measure_cells_tiled_can_disable_erosion_and_expansion(tmp_path: Path):
     props = measured[1]
     assert not any(k.startswith("Cell: ErosionBin_") for k in props)
     assert not any(k.startswith("Cell: ExpansionBin_") for k in props)
+
+
+def test_measure_cells_tiled_environment_expansion(tmp_path: Path):
+    img = np.ones((15, 15), dtype=np.uint16) * 7
+    tiff_path = tmp_path / "img_environment.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((15, 15), dtype=np.uint32)
+    wc[6:9, 6:9] = 1
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(6, 6, 9, 9),
+        centroid=(7.0, 7.0),
+        nucleus_area_px=0,
+        cell_area_px=9,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+
+    measured = measure_cells_tiled(
+        cells=[cell],
+        nuc_labels=None,
+        wc_labels=da.from_array(wc, chunks=(15, 15)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(15, 15),
+        tile_size=15,
+        tile_overlap=0,
+        threads=1,
+        expansion_enabled=False,
+        environment_expansion_enabled=True,
+        pixel_size_microns=10.0,  # 20 µm => 2 px dilation radius
+    )
+
+    props = measured[1]
+    assert props["Cell: Environment_20um: Pixel_Count"] > 0
+    assert "Channel 1: Cell: Environment_20um: Mean" in props
+    assert props["Channel 1: Cell: Environment_20um: Mean"] == 7.0
+
+
+def test_measure_cells_tiled_neighbour_aggregation(tmp_path: Path):
+    img = np.ones((10, 10), dtype=np.uint16)
+    tiff_path = tmp_path / "img_neighbours.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((10, 10), dtype=np.uint32)
+    wc[1:3, 1:3] = 1  # area 4
+    wc[1:4, 5:8] = 2  # area 9
+
+    cells = [
+        CellMatch(
+            cell_id=1,
+            nucleus_label=None,
+            whole_cell_label=1,
+            bbox=(1, 1, 3, 3),
+            centroid=(1.5, 1.5),
+            nucleus_area_px=0,
+            cell_area_px=4,
+            overlap_px=0,
+            overlap_fraction=0.0,
+            match_source="wc_only",
+        ),
+        CellMatch(
+            cell_id=2,
+            nucleus_label=None,
+            whole_cell_label=2,
+            bbox=(1, 5, 4, 8),
+            centroid=(2.0, 6.0),
+            nucleus_area_px=0,
+            cell_area_px=9,
+            overlap_px=0,
+            overlap_fraction=0.0,
+            match_source="wc_only",
+        ),
+    ]
+
+    measured = measure_cells_tiled(
+        cells=cells,
+        nuc_labels=None,
+        wc_labels=da.from_array(wc, chunks=(10, 10)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(10, 10),
+        tile_size=10,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+        neighbours=1,
+        pixel_size_microns=1.0,
+    )
+
+    assert measured[1]["Neighbours: Mean: Cell: Area µm^2"] == 9.0
+    assert measured[2]["Neighbours: Mean: Cell: Area µm^2"] == 4.0
+
+
+def test_measure_cells_tiled_streams_jsonl_with_neighbours(tmp_path: Path):
+    img = np.ones((8, 8), dtype=np.uint16)
+    tiff_path = tmp_path / "img_stream_neighbours.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((8, 8), dtype=np.uint32)
+    wc[1:3, 1:3] = 1
+    wc[1:3, 4:6] = 2
+
+    cells = [
+        CellMatch(
+            cell_id=1,
+            nucleus_label=None,
+            whole_cell_label=1,
+            bbox=(1, 1, 3, 3),
+            centroid=(1.5, 1.5),
+            nucleus_area_px=0,
+            cell_area_px=4,
+            overlap_px=0,
+            overlap_fraction=0.0,
+            match_source="wc_only",
+        ),
+        CellMatch(
+            cell_id=2,
+            nucleus_label=None,
+            whole_cell_label=2,
+            bbox=(1, 4, 3, 6),
+            centroid=(1.5, 4.5),
+            nucleus_area_px=0,
+            cell_area_px=4,
+            overlap_px=0,
+            overlap_fraction=0.0,
+            match_source="wc_only",
+        ),
+    ]
+
+    jsonl_path = tmp_path / "measurements-neighbours.jsonl"
+    measured = measure_cells_tiled(
+        cells=cells,
+        nuc_labels=None,
+        wc_labels=da.from_array(wc, chunks=(8, 8)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(8, 8),
+        tile_size=8,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+        neighbours=1,
+        jsonl_path=jsonl_path,
+        return_results=False,
+        pixel_size_microns=1.0,
+    )
+
+    assert measured == {}
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    payloads = [json.loads(line) for line in lines if line.strip()]
+    assert payloads
+    first_measurements = payloads[0]["measurements"]
+    assert "Neighbours: Mean: Cell: Area µm^2" in first_measurements

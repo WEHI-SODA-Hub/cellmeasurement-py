@@ -239,6 +239,10 @@ class TestResolveOneToOne:
 
 
 class TestMatchRois:
+    def test_raises_if_dist_threshold_nonpositive(self):
+        with pytest.raises(ValueError, match="dist_threshold"):
+            match_rois(_make_da(NUC_2x2), _make_da(WC_2x2), dist_threshold=0)
+
     def test_raises_if_both_none(self):
         with pytest.raises(ValueError, match="At least one"):
             match_rois(None, None)
@@ -262,7 +266,7 @@ class TestMatchRois:
     def test_paired_mode_clean_match(self):
         nuc = _make_da(NUC_2x2)
         wc = _make_da(WC_2x2)
-        cells, synth_geoms = match_rois(nuc, wc, synthesis_dist=1.0)
+        cells, synth_geoms = match_rois(nuc, wc, estimate_cell_boundary_dist=1.0)
         overlap_cells = [c for c in cells if c.match_source == "overlap_1to1"]
         assert len(overlap_cells) == 2
         pairs = {(c.nucleus_label, c.whole_cell_label) for c in overlap_cells}
@@ -277,7 +281,7 @@ class TestMatchRois:
         wc = np.array(
             [[0, 10, 0, 0], [0, 10, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int32
         )
-        cells, synth_geoms = match_rois(_make_da(nuc), _make_da(wc), synthesis_dist=1.5)
+        cells, synth_geoms = match_rois(_make_da(nuc), _make_da(wc), estimate_cell_boundary_dist=1.5)
         sources = {c.match_source for c in cells}
         assert "overlap_1to1" in sources
         assert "watershed_synth" in sources
@@ -293,9 +297,51 @@ class TestMatchRois:
     def test_conflict_only_one_match_produced(self):
         nuc = _make_da(NUC_CONFLICT)
         wc = _make_da(WC_CONFLICT)
-        cells, _ = match_rois(nuc, wc, synthesis_dist=1.0)
+        cells, _ = match_rois(nuc, wc, estimate_cell_boundary_dist=1.0)
         overlap = [c for c in cells if c.match_source == "overlap_1to1"]
         assert len(overlap) == 1
+
+    def test_distance_threshold_matches_non_overlapping_nearby_pair(self):
+        nuc = np.array(
+            [[0, 1, 1, 0, 0], [0, 1, 1, 0, 0], [0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        wc = np.array(
+            [[0, 0, 0, 10, 10], [0, 0, 0, 10, 10], [0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        cells, synth_geoms = match_rois(
+            _make_da(nuc, chunks=(3, 5)),
+            _make_da(wc, chunks=(3, 5)),
+            dist_threshold=2.5,
+            estimate_cell_boundary_dist=1.0,
+        )
+        assert len(cells) == 1
+        assert cells[0].match_source == "overlap_1to1"
+        assert cells[0].nucleus_label == 1
+        assert cells[0].whole_cell_label == 10
+        assert cells[0].overlap_px == 0
+        assert synth_geoms == {}
+
+    def test_distance_threshold_too_small_falls_back_to_synthesis(self):
+        nuc = np.array(
+            [[0, 1, 1, 0, 0], [0, 1, 1, 0, 0], [0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        wc = np.array(
+            [[0, 0, 0, 10, 10], [0, 0, 0, 10, 10], [0, 0, 0, 0, 0]],
+            dtype=np.int32,
+        )
+        cells, synth_geoms = match_rois(
+            _make_da(nuc, chunks=(3, 5)),
+            _make_da(wc, chunks=(3, 5)),
+            dist_threshold=1.0,
+            estimate_cell_boundary_dist=1.0,
+        )
+        assert len(cells) == 1
+        assert cells[0].match_source == "watershed_synth"
+        assert cells[0].whole_cell_label is None
+        assert cells[0].cell_id in synth_geoms
 
     def test_cell_ids_start_at_one(self):
         nuc = _make_da(NUC_2x2)

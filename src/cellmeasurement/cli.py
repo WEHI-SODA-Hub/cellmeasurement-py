@@ -111,7 +111,7 @@ def main(
             help="Keep temporary TIFF-converted zarr stores instead of deleting them at exit.",
         ),
     ] = False,
-    synthesis_dist: Annotated[
+    estimate_cell_boundary_dist: Annotated[
         float,
         typer.Option(
             help=(
@@ -120,6 +120,15 @@ def main(
             )
         ),
     ] = 3.0,
+    dist_threshold: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Maximum centroid distance (pixels) for matching nuclei to whole cells "
+                "before synthesis."
+            )
+        ),
+    ] = 10.0,
     measurements: Annotated[
         bool,
         typer.Option(
@@ -159,6 +168,24 @@ def main(
             help="Enable/disable equal-area 20um expansion-bin measurements.",
         ),
     ] = True,
+    environment_expansion: Annotated[
+        bool,
+        typer.Option(
+            "--environment-expansion/--no-environment-expansion",
+            help="Enable/disable 20um pericellular environment measurements.",
+        ),
+    ] = False,
+    neighbours: Annotated[
+        int,
+        typer.Option(
+            "--neighbours",
+            "--neighbors",
+            help=(
+                "Number of nearest neighbours for aggregated measurements "
+                "(0 disables neighbour aggregation)."
+            )
+        ),
+    ] = 0,
     pixel_size_microns: Annotated[
         float,
         typer.Option(
@@ -223,6 +250,12 @@ def main(
     if pixel_size_microns <= 0:
         typer.echo("Error: --pixel-size-microns must be > 0.", err=True)
         raise typer.Exit(code=1)
+    if neighbours < 0:
+        typer.echo("Error: --neighbours must be >= 0.", err=True)
+        raise typer.Exit(code=1)
+    if dist_threshold <= 0:
+        typer.echo("Error: --dist-threshold must be > 0.", err=True)
+        raise typer.Exit(code=1)
 
     nuc_mask: SegmentationMask | None = None
     wc_mask: SegmentationMask | None = None
@@ -246,7 +279,12 @@ def main(
         image_shape = (nuc_mask or wc_mask).shape  # type: ignore[union-attr]
 
         typer.echo("Matching ROIs...")
-        cells, synth_geoms = match_rois(nuc_arr, wc_arr, synthesis_dist=synthesis_dist)
+        cells, synth_geoms = match_rois(
+            nuc_arr,
+            wc_arr,
+            dist_threshold=dist_threshold,
+            estimate_cell_boundary_dist=estimate_cell_boundary_dist,
+        )
         typer.echo(f"Matched {len(cells)} cells.")
 
         measurements_by_cell: dict[int, dict[str, float]] | None = None
@@ -278,6 +316,8 @@ def main(
                     threads=threads,
                     erosion_enabled=erosion_steps,
                     expansion_enabled=expansion_steps,
+                    environment_expansion_enabled=environment_expansion,
+                    neighbours=neighbours,
                     pixel_size_microns=pixel_size_microns,
                     jsonl_path=measurements_jsonl_path,
                     return_results=False,

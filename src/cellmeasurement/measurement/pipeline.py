@@ -13,6 +13,7 @@ import dask.array as da
 import numpy as np
 import tifffile
 from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
 from shapely.geometry import Polygon
 from skimage.draw import polygon as draw_polygon
 from skimage.measure import regionprops
@@ -449,6 +450,40 @@ def _add_expansion_measurements(
         prev_mask = dilated_mask
 
 
+def _add_environment_measurements(
+    props: dict[str, float],
+    image_cyx: np.ndarray,
+    ch_names: Sequence[str],
+    cell_mask: np.ndarray,
+    pixel_size_microns: float,
+) -> None:
+    """Populate 20 µm pericellular environment measurements."""
+    environment_um = 20.0
+    expansion_px = max(1, int(round(environment_um / pixel_size_microns)))
+    cm = cell_mask.astype(bool)
+    if not np.any(cm):
+        return
+
+    dilated = ndi.binary_dilation(cm, structure=_DISK_1, iterations=expansion_px)
+    env_mask = dilated & ~cm
+    env_area = int(np.count_nonzero(env_mask))
+    if env_area == 0:
+        return
+
+    base_area = int(np.count_nonzero(cm))
+    props["Cell: Environment_20um: Pixel_Count"] = float(env_area)
+    props["Cell: Environment_20um: Area_Fraction"] = float(env_area / base_area) if base_area > 0 else 0.0
+    for ci, ch in enumerate(ch_names):
+        vals = image_cyx[ci][env_mask]
+        if vals.size == 0:
+            continue
+        props[f"{ch}: Cell: Environment_20um: Mean"] = float(np.mean(vals))
+        props[f"{ch}: Cell: Environment_20um: Median"] = float(np.median(vals))
+        props[f"{ch}: Cell: Environment_20um: Min"] = float(np.min(vals))
+        props[f"{ch}: Cell: Environment_20um: Max"] = float(np.max(vals))
+        props[f"{ch}: Cell: Environment_20um: Std.Dev."] = float(np.std(vals))
+
+
 def _polygon_to_local_mask(poly: Polygon, bbox: tuple[int, int, int, int]) -> np.ndarray:
     """Rasterize a global polygon into a local bbox mask."""
     r0, c0, r1, c1 = bbox
@@ -539,6 +574,7 @@ def _measure_single_cell(
     ch_names: Sequence[str],
     erosion_enabled: bool,
     expansion_enabled: bool,
+    environment_expansion_enabled: bool,
     pixel_size_microns: float,
 ) -> dict[str, float]:
     """Compute all measurement families for a single cell crop."""
@@ -553,7 +589,7 @@ def _measure_single_cell(
     _add_percentiles(measurements, image_crop, ch_names, comps, percentiles)
     if erosion_enabled:
         _add_erosion_measurements(measurements, image_crop, ch_names, comps, n_bins=5)
-    if expansion_enabled and expansion_image_crop is not None and expansion_bbox is not None:
+    if (expansion_enabled or environment_expansion_enabled) and expansion_image_crop is not None and expansion_bbox is not None:
         expansion_cell_mask, _ = _cell_masks_from_crops(
             cell,
             expansion_nuc_crop,
@@ -561,14 +597,23 @@ def _measure_single_cell(
             synth_geoms,
             expansion_bbox,
         )
-        _add_expansion_measurements(
-            measurements,
-            expansion_image_crop,
-            ch_names,
-            expansion_cell_mask,
-            pixel_size_microns=pixel_size_microns,
-            n_bins=5,
-        )
+        if expansion_enabled:
+            _add_expansion_measurements(
+                measurements,
+                expansion_image_crop,
+                ch_names,
+                expansion_cell_mask,
+                pixel_size_microns=pixel_size_microns,
+                n_bins=5,
+            )
+        if environment_expansion_enabled:
+            _add_environment_measurements(
+                measurements,
+                expansion_image_crop,
+                ch_names,
+                expansion_cell_mask,
+                pixel_size_microns=pixel_size_microns,
+            )
     return measurements
 
 
@@ -586,6 +631,7 @@ def _measure_tile(
     percentiles: Sequence[float],
     erosion_enabled: bool,
     expansion_enabled: bool,
+    environment_expansion_enabled: bool,
     pixel_size_microns: float,
 ) -> tuple[dict[int, dict[str, float]], int]:
     """Measure all cells owned by a single tile and count fallback reads."""
@@ -625,7 +671,7 @@ def _measure_tile(
         expansion_nuc_crop: np.ndarray | None = None
         expansion_wc_crop: np.ndarray | None = None
         expansion_bbox: tuple[int, int, int, int] | None = None
-        if expansion_enabled:
+        if expansion_enabled or environment_expansion_enabled:
             pad_px = max(1, int(round(20.0 / pixel_size_microns)))
             er0 = max(0, br0 - pad_px)
             ec0 = max(0, bc0 - pad_px)
@@ -662,11 +708,75 @@ def _measure_tile(
             ch_names=ch_names,
             erosion_enabled=erosion_enabled,
             expansion_enabled=expansion_enabled,
+            environment_expansion_enabled=environment_expansion_enabled,
             pixel_size_microns=pixel_size_microns,
         )
         results[cell.cell_id] = measurement
 
     return results, fallback_reads
+
+
+def _add_neighbour_measurements(
+    measurements_by_cell: dict[int, dict[str, float]],
+    cells: Sequence[CellMatch],
+    neighbours: int,
+    pixel_size_microns: float,
+) -> None:
+    """Aggregate numeric measurements over k nearest neighbours within a 20 µm cap."""
+    if neighbours <= 0 or len(measurements_by_cell) < 2:
+        return
+
+    centroid_by_cell: dict[int, tuple[float, float]] = {cell.cell_id: cell.centroid for cell in cells}
+    ordered_ids = [cid for cid in sorted(measurements_by_cell) if cid in centroid_by_cell]
+    if len(ordered_ids) < 2:
+        return
+
+    max_distance_px = 20.0 / pixel_size_microns
+    centroids = np.array([centroid_by_cell[cid] for cid in ordered_ids], dtype=np.float64)
+    tree = cKDTree(centroids)
+    actual_k = min(neighbours + 1, len(ordered_ids))
+    if actual_k <= 1:
+        return
+
+    distances, indices = tree.query(centroids, k=actual_k)
+
+    numeric_keys: set[str] = set()
+    for cell_id in ordered_ids:
+        for key, value in measurements_by_cell[cell_id].items():
+            if key.startswith("Neighbours: "):
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                numeric_keys.add(key)
+    if not numeric_keys:
+        return
+
+    key_vectors: dict[str, np.ndarray] = {}
+    for key in numeric_keys:
+        arr = np.full(len(ordered_ids), np.nan, dtype=np.float64)
+        for i, cell_id in enumerate(ordered_ids):
+            value = measurements_by_cell[cell_id].get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                arr[i] = float(value)
+        key_vectors[key] = arr
+
+    for i, cell_id in enumerate(ordered_ids):
+        neighbour_idx = np.asarray(indices[i, 1:actual_k], dtype=np.int64)
+        neighbour_dist = np.asarray(distances[i, 1:actual_k], dtype=np.float64)
+        within = neighbour_dist <= max_distance_px
+        neighbour_idx = neighbour_idx[within]
+        if neighbour_idx.size == 0:
+            continue
+
+        cell_measurements = measurements_by_cell[cell_id]
+        for key, arr in key_vectors.items():
+            vals = arr[neighbour_idx]
+            vals = vals[np.isfinite(vals)]
+            if vals.size > 0:
+                cell_measurements[f"Neighbours: Mean: {key}"] = float(np.mean(vals))
 
 
 def _write_measurement_jsonl_row(
@@ -692,6 +802,8 @@ def measure_cells_tiled(
     threads: int = 1,
     erosion_enabled: bool = True,
     expansion_enabled: bool = True,
+    environment_expansion_enabled: bool = False,
+    neighbours: int = 0,
     pixel_size_microns: float = 0.5,
     jsonl_path: Path | None = None,
     return_results: bool = True,
@@ -712,7 +824,7 @@ def measure_cells_tiled(
     wc_labels:
         Whole-cell label array (or ``None`` in nuclear-only mode).
     synth_geoms:
-        Mapping from ``cell_id`` to synthesized cell polygons for
+        Mapping from ``cell_id`` to synthesised cell polygons for
         ``match_source="watershed_synth"`` cells.
     tiff_file:
         Path to intensity TIFF image; loaded and normalized to ``(C, Y, X)``.
@@ -730,6 +842,10 @@ def measure_cells_tiled(
         Whether to compute equal-area erosion-bin measurements.
     expansion_enabled:
         Whether to compute equal-area expansion-bin measurements.
+    environment_expansion_enabled:
+        Whether to compute 20 µm pericellular environment measurements.
+    neighbours:
+        Number of nearest neighbours for measurement aggregation (0 disables).
     pixel_size_microns:
         Pixel size used for converting the fixed 20 µm expansion radius to pixels
         and for µm-scaled shape metrics.
@@ -754,6 +870,8 @@ def measure_cells_tiled(
     """
     if not cells:
         return {}
+    if neighbours < 0:
+        raise ValueError("neighbours must be >= 0")
 
     image_cyx, ch_names = _load_tiff_image(tiff_file)
     if image_cyx.shape[1:] != image_shape:
@@ -762,7 +880,9 @@ def measure_cells_tiled(
         )
 
     tile_groups = _group_cells_by_tile(cells, tile_size=tile_size)
-    results: dict[int, dict[str, float]] = {} if return_results else {}
+    needs_neighbour_aggregation = neighbours > 0
+    collect_results = return_results or needs_neighbour_aggregation
+    results: dict[int, dict[str, float]] = {}
     stream_pending: dict[int, dict[str, float]] = {}
     next_stream_id = min(cell.cell_id for cell in cells)
     stream_fh = None
@@ -798,11 +918,13 @@ def measure_cells_tiled(
                     percentiles=percentiles,
                     erosion_enabled=erosion_enabled,
                     expansion_enabled=expansion_enabled,
+                    environment_expansion_enabled=environment_expansion_enabled,
                     pixel_size_microns=pixel_size_microns,
                 )
-                if return_results:
+                if collect_results:
                     results.update(tile_result)
-                _flush_stream_rows(tile_result)
+                if not needs_neighbour_aggregation:
+                    _flush_stream_rows(tile_result)
                 fallback_reads += tile_fallback
         else:
             with ThreadPoolExecutor(max_workers=threads) as executor:
@@ -822,23 +944,37 @@ def measure_cells_tiled(
                         percentiles,
                         erosion_enabled,
                         expansion_enabled,
+                        environment_expansion_enabled,
                         pixel_size_microns,
                     ): key
                     for key, group in tile_groups.items()
                 }
                 for future in as_completed(future_map):
                     tile_result, tile_fallback = future.result()
-                    if return_results:
+                    if collect_results:
                         results.update(tile_result)
-                    _flush_stream_rows(tile_result)
+                    if not needs_neighbour_aggregation:
+                        _flush_stream_rows(tile_result)
                     fallback_reads += tile_fallback
+
+        if needs_neighbour_aggregation:
+            _add_neighbour_measurements(
+                measurements_by_cell=results,
+                cells=cells,
+                neighbours=neighbours,
+                pixel_size_microns=pixel_size_microns,
+            )
     finally:
         if stream_fh is not None:
-            # Flush any unresolved IDs (e.g. non-contiguous id sets).
-            for cell_id in sorted(stream_pending):
-                _write_measurement_jsonl_row(stream_fh, cell_id, stream_pending[cell_id])
+            if needs_neighbour_aggregation:
+                for cell in sorted(cells, key=lambda c: c.cell_id):
+                    _write_measurement_jsonl_row(stream_fh, cell.cell_id, results.get(cell.cell_id, {}))
+            else:
+                # Flush any unresolved IDs (e.g. non-contiguous id sets).
+                for cell_id in sorted(stream_pending):
+                    _write_measurement_jsonl_row(stream_fh, cell_id, stream_pending[cell_id])
             stream_fh.close()
 
     if fallback_reads > 0:
         logger.info("Tile measurement fallback direct bbox reads: %d", fallback_reads)
-    return results
+    return results if return_results else {}

@@ -33,7 +33,8 @@ class CellMatch:
             ``nucleus_area_px`` is zero.
         match_source: Provenance tag describing how this cell was created.
 
-            * ``"overlap_1to1"`` – matched by pixel overlap (primary path).
+            * ``"overlap_1to1"`` – matched 1-to-1 by pixel overlap (primary
+              path) or centroid distance threshold (secondary fallback).
             * ``"watershed_synth"`` – nucleus had no matching whole-cell label;
               boundary was synthesised by watershed expansion.
             * ``"wc_only"`` – whole-cell-only mode; no nuclear mask was

@@ -83,7 +83,7 @@ def _load_zarr_with_boundaries(mask_path: Path, parquet_path: str) -> Segmentati
     boundaries.index = boundaries.index + 1
 
     labels = da.from_delayed(
-        dask.delayed(_rasterize_boundaries)(boundaries, H, W),
+        dask.delayed(_rasterize_boundaries)(boundaries, H, W),  # type: ignore
         shape=(H, W),
         dtype=np.int32,
     )
