@@ -89,7 +89,7 @@ def test_main_cleans_temp_store_by_default(monkeypatch, tmp_path):
         return dummy
 
     monkeypatch.setattr(cli, "load_mask", fake_load_mask)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
@@ -120,7 +120,7 @@ def test_main_keeps_temp_store_when_flag_enabled(monkeypatch, tmp_path):
     dummy = DummyMask()
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
@@ -171,7 +171,7 @@ def test_main_mixed_zarr_tiff_validates_and_cleans_only_temp(monkeypatch, tmp_pa
 
     monkeypatch.setattr(cli, "load_mask", fake_load_mask)
     monkeypatch.setattr(cli, "validate_grid_compatibility", fake_validate)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
@@ -204,7 +204,7 @@ def test_main_preserves_primary_error_when_cleanup_fails(monkeypatch, tmp_path, 
     monkeypatch.setattr(
         cli,
         "match_rois",
-        lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
+        lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
     )
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
@@ -234,7 +234,7 @@ def test_main_measurements_on_by_default(monkeypatch, tmp_path):
     called = {"measure": False}
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
 
     def fake_measure(**kwargs):
@@ -271,7 +271,7 @@ def test_main_warns_when_measurements_requested_without_tiff(monkeypatch, tmp_pa
     called = {"measure": False, "writer_measurements": "unset", "writer_jsonl": "unset"}
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
 
     def fake_measure(**kwargs):
@@ -319,7 +319,7 @@ def test_main_runs_measurements_when_enabled_with_tiff(monkeypatch, tmp_path):
     )[0][0]
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
-    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist: ([cell], {}))
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([cell], {}))
     monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
 
     def fake_measure(**kwargs):
@@ -378,7 +378,7 @@ def test_main_passes_step_toggles_to_measurements(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
 
-    def fake_match_rois(nuc, wc, dist_threshold, estimate_cell_boundary_dist):
+    def fake_match_rois(nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor):
         match_called["dist_threshold"] = dist_threshold
         return [cell], {}
 

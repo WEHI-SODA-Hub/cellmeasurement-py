@@ -195,6 +195,17 @@ def main(
             )
         ),
     ] = 0.5,
+    downsample_factor: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Downsample factor for image and masks (e.g. 2.0, 4.0). "
+                "Reduces memory usage and improves performance for large images. "
+                "Values <= 1.0 or that round to step < 2 result in no downsampling. "
+                "When downsampling is applied, effective pixel size increases proportionally."
+            )
+        ),
+    ] = 1.0,
     tile_size: Annotated[
         int,
         typer.Option(help="Tile size in pixels for batched measurement image reads."),
@@ -256,6 +267,17 @@ def main(
     if dist_threshold <= 0:
         typer.echo("Error: --dist-threshold must be > 0.", err=True)
         raise typer.Exit(code=1)
+    if downsample_factor <= 0:
+        typer.echo("Error: --downsample-factor must be > 0.", err=True)
+        raise typer.Exit(code=1)
+    if downsample_factor > 1.0:
+        step = int(round(downsample_factor))
+        if step < 2:
+            typer.echo(
+                f"Warning: --downsample-factor {downsample_factor} rounds to step={step}; "
+                "no downsampling will be applied.",
+                err=False,
+            )
 
     nuc_mask: SegmentationMask | None = None
     wc_mask: SegmentationMask | None = None
@@ -276,7 +298,7 @@ def main(
 
         nuc_arr = nuc_mask.labels if nuc_mask is not None else None
         wc_arr = wc_mask.labels if wc_mask is not None else None
-        image_shape = (nuc_mask or wc_mask).shape  # type: ignore[union-attr]
+        image_shape = (nuc_mask or wc_mask).shape
 
         typer.echo("Matching ROIs...")
         cells, synth_geoms = match_rois(
@@ -284,6 +306,7 @@ def main(
             wc_arr,
             dist_threshold=dist_threshold,
             estimate_cell_boundary_dist=estimate_cell_boundary_dist,
+            downsample_factor=downsample_factor,
         )
         typer.echo(f"Matched {len(cells)} cells.")
 
@@ -319,6 +342,7 @@ def main(
                     environment_expansion_enabled=environment_expansion,
                     neighbours=neighbours,
                     pixel_size_microns=pixel_size_microns,
+                    downsample_factor=downsample_factor,
                     jsonl_path=measurements_jsonl_path,
                     return_results=False,
                 )

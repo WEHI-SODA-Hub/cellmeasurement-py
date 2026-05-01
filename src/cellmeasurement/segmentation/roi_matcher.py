@@ -68,6 +68,7 @@ def match_rois(
     wc_labels: da.Array | None,
     dist_threshold: float = 10.0,
     estimate_cell_boundary_dist: float = 3.0,
+    downsample_factor: float = 1.0,
 ) -> tuple[list[CellMatch], dict[CellId, Polygon]]:
     """Match nuclear ROIs to whole-cell ROIs and return a list of cells.
 
@@ -87,9 +88,14 @@ def match_rois(
         wc_labels: 2-D dask label array for the whole-cell segmentation, or
             ``None`` for nuclear-only mode.
         dist_threshold: Maximum centroid distance (pixels) used for secondary
-            nearest-neighbour matching after overlap assignment.
+            nearest-neighbour matching after overlap assignment. Interpreted
+            in downsampled coordinate space if downsample_factor > 1.
         estimate_cell_boundary_dist: Radius in pixels for watershed expansion of unmatched
-            nuclei.  Ignored in single-mask modes.
+            nuclei.  Ignored in single-mask modes. Interpreted in downsampled
+            coordinate space if downsample_factor > 1.
+        downsample_factor: Optional downsampling factor (e.g. 2.0, 4.0) to reduce
+            memory usage before matching. Values <= 1.0 or that round to step < 2
+            result in no downsampling.
 
     Returns:
         A two-tuple of:
@@ -106,12 +112,41 @@ def match_rois(
         raise ValueError("At least one of nuc_labels or wc_labels must be provided.")
     if dist_threshold <= 0:
         raise ValueError("dist_threshold must be > 0")
+    if downsample_factor <= 0:
+        raise ValueError("downsample_factor must be > 0")
 
+    # Handle single-mask modes before attempting downsampling (which requires both masks)
     if nuc_labels is None:
         assert wc_labels is not None
         return _wc_only_matches(wc_labels), {}
     if wc_labels is None:
         return _nuc_only_matches(nuc_labels), {}
+
+    # Type narrowers: guarantee both are non-None past this point for paired mode
+    assert nuc_labels is not None
+    assert wc_labels is not None
+
+    # Apply optional downsampling to both label arrays (paired mode only)
+    if downsample_factor > 1.0:
+        from ..io.image_loading import maybe_downsample
+        import numpy as np_for_downsample
+
+        step = int(round(downsample_factor))
+        if step >= 2:
+            # Convert dask arrays to numpy for downsampling (since they're typically not huge)
+            nuc_np = np_for_downsample.asarray(nuc_labels)
+            wc_np = np_for_downsample.asarray(wc_labels)
+
+            # Create a dummy image array for maybe_downsample compatibility
+            # (we only care about the mask downsampling part)
+            dummy_img = np_for_downsample.zeros((1, wc_np.shape[0], wc_np.shape[1]), dtype=np_for_downsample.float32)
+
+            _, nuc_ds, wc_ds = maybe_downsample(dummy_img, nuc_np, wc_np, downsample_factor)
+
+            # Convert back to dask arrays with sensible chunks
+            nuc_labels = da.from_array(nuc_ds, chunks="auto")
+            wc_labels = da.from_array(wc_ds, chunks="auto")
+            logger.info("Applied downsampling factor %.1f (step=%d) to label arrays", downsample_factor, step)
 
     # Paired mode ------------------------------------------------------------
     H, W = int(nuc_labels.shape[0]), int(nuc_labels.shape[1])

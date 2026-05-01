@@ -805,6 +805,7 @@ def measure_cells_tiled(
     environment_expansion_enabled: bool = False,
     neighbours: int = 0,
     pixel_size_microns: float = 0.5,
+    downsample_factor: float = 1.0,
     jsonl_path: Path | None = None,
     return_results: bool = True,
 ) -> dict[int, dict[str, float]]:
@@ -848,7 +849,11 @@ def measure_cells_tiled(
         Number of nearest neighbours for measurement aggregation (0 disables).
     pixel_size_microns:
         Pixel size used for converting the fixed 20 µm expansion radius to pixels
-        and for µm-scaled shape metrics.
+        and for µm-scaled shape metrics. When downsampling is applied, effective
+        pixel size increases proportionally.
+    downsample_factor:
+        Optional downsampling factor (e.g. 2.0, 4.0) to reduce memory usage.
+        Values <= 1.0 or that round to step < 2 result in no downsampling.
     jsonl_path:
         Optional output path for streamed JSONL rows shaped as
         ``{"cell_id": int, "measurements": {...}}``.
@@ -872,12 +877,31 @@ def measure_cells_tiled(
         return {}
     if neighbours < 0:
         raise ValueError("neighbours must be >= 0")
+    if downsample_factor <= 0:
+        raise ValueError("downsample_factor must be > 0")
 
     image_cyx, ch_names = _load_tiff_image(tiff_file)
     if image_cyx.shape[1:] != image_shape:
         raise ValueError(
             f"TIFF image shape {tuple(image_cyx.shape[1:])} does not match segmentation shape {image_shape}."
         )
+
+    # Apply optional downsampling to image and label masks
+    effective_pixel_size = pixel_size_microns
+    if downsample_factor > 1.0:
+        from ..io.image_loading import maybe_downsample
+
+        step = int(round(downsample_factor))
+        if step >= 2:
+            nuc_np = None if nuc_labels is None else np.asarray(nuc_labels)
+            wc_np = np.asarray(wc_labels)
+
+            image_cyx, nuc_ds, wc_ds = maybe_downsample(image_cyx, nuc_np, wc_np, downsample_factor)
+
+            nuc_labels = nuc_ds
+            wc_labels = wc_ds
+            effective_pixel_size = pixel_size_microns * step
+            logger.info("Applied downsampling factor %.1f to image and masks; effective pixel size now %.2f µm", downsample_factor, effective_pixel_size)
 
     tile_groups = _group_cells_by_tile(cells, tile_size=tile_size)
     needs_neighbour_aggregation = neighbours > 0
@@ -919,7 +943,7 @@ def measure_cells_tiled(
                     erosion_enabled=erosion_enabled,
                     expansion_enabled=expansion_enabled,
                     environment_expansion_enabled=environment_expansion_enabled,
-                    pixel_size_microns=pixel_size_microns,
+                    pixel_size_microns=effective_pixel_size,
                 )
                 if collect_results:
                     results.update(tile_result)
@@ -945,7 +969,7 @@ def measure_cells_tiled(
                         erosion_enabled,
                         expansion_enabled,
                         environment_expansion_enabled,
-                        pixel_size_microns,
+                        effective_pixel_size,
                     ): key
                     for key, group in tile_groups.items()
                 }
@@ -962,7 +986,7 @@ def measure_cells_tiled(
                 measurements_by_cell=results,
                 cells=cells,
                 neighbours=neighbours,
-                pixel_size_microns=pixel_size_microns,
+                pixel_size_microns=effective_pixel_size,
             )
     finally:
         if stream_fh is not None:

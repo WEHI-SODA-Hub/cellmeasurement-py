@@ -182,7 +182,7 @@ def _collect_label_bboxes(label_arr: da.Array) -> dict[int, tuple[int, int, int,
     n_col = len(label_arr.chunks[1])
     row_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[0])[:-1]]
     col_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[1])[:-1]]
-    delayed_arr = label_arr.to_delayed()  # type: ignore[arg-type]
+    delayed_arr = label_arr.to_delayed()
     delayed_results = [
         delayed(_bboxes_chunk)(delayed_arr[i, j], row_offs[i], col_offs[j])
         for i in range(n_row)
