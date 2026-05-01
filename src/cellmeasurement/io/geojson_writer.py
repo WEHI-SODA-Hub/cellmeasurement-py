@@ -24,11 +24,15 @@ Geometry sources per ``match_source``:
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from shapely.geometry import Polygon, mapping
+import numpy as np
+import tifffile
+from shapely.geometry import Polygon, mapping, shape
+from skimage.draw import polygon as draw_polygon
 
 from ..geometry.overlap_constraint import constrain_cell_overlaps
 
@@ -37,6 +41,63 @@ if TYPE_CHECKING:
 
 # SynthGeoms maps cell_id -> pre-simplified Polygon for watershed_synth cells.
 SynthGeoms = dict[int, Polygon]
+
+
+def _rasterise_features_to_mask(
+    features: list[dict],
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Rasterise final cell polygons to an integer label mask.
+
+    Uses post-constraint feature geometries so raster output matches the final
+    exported non-overlapping polygons.
+    """
+    max_id = max(
+        (
+            int(feat.get("properties", {}).get("id", 0))
+            for feat in features
+            if feat.get("properties", {}).get("objectType") == "cell"
+        ),
+        default=0,
+    )
+    dtype = np.int32 if max_id < (2**31) else np.int64
+    mask = np.zeros((height, width), dtype=dtype)
+
+    for feat in features:
+        props = feat.get("properties", {})
+        if props.get("objectType") != "cell":
+            continue
+        cell_id = int(props.get("id", 0))
+        if cell_id <= 0:
+            continue
+
+        geom = shape(feat["geometry"])
+        if geom.is_empty:
+            continue
+
+        polygons: list[Polygon]
+        if geom.geom_type == "Polygon":
+            polygons = [geom]  # type: ignore[list-item]
+        elif geom.geom_type == "MultiPolygon":
+            polygons = list(geom.geoms)  # type: ignore[assignment]
+        else:
+            continue
+
+        for poly in polygons:
+            exterior = np.asarray(poly.exterior.coords)
+            if exterior.shape[0] < 3:
+                continue
+            rr, cc = draw_polygon(exterior[:, 1], exterior[:, 0], shape=(height, width))
+            mask[rr, cc] = cell_id
+            for hole in poly.interiors:
+                interior = np.asarray(hole.coords)
+                if interior.shape[0] < 3:
+                    continue
+                rr_h, cc_h = draw_polygon(interior[:, 1], interior[:, 0], shape=(height, width))
+                mask[rr_h, cc_h] = 0
+
+    return mask
 
 
 def _extract_geometries(
@@ -128,6 +189,8 @@ def write_geojson(
     measurements_jsonl_path: Path | None = None,
     constrain_overlaps: bool = True,
     pretty: bool = False,
+    gzip_output: bool = False,
+    output_mask: Path | None = None,
 ) -> int:
     """Write cell matches to a GeoJSON FeatureCollection.
 
@@ -160,6 +223,10 @@ def write_geojson(
         constrain_overlaps: Whether to run overlap clipping so no two cell
             polygons share area.
         pretty: Write indented (human-readable) JSON.
+        gzip_output: Write gzip-compressed GeoJSON; appends ``.gz`` suffix if
+            needed.
+        output_mask: Optional TIFF path for rasterised final cell
+            polygons.
 
     Returns:
         Number of cell features written (excluding the annotation).
@@ -227,11 +294,27 @@ def write_geojson(
         "features": [annotation] + features,
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        if pretty:
-            json.dump(collection, f, indent=2)
-        else:
-            json.dump(collection, f, separators=(",", ":"))
+    final_output_path = output_path
+    if gzip_output and not str(final_output_path).endswith(".gz"):
+        final_output_path = Path(str(final_output_path) + ".gz")
+
+    final_output_path.parent.mkdir(parents=True, exist_ok=True)
+    if gzip_output:
+        with gzip.open(final_output_path, "wt", encoding="utf-8") as f:
+            if pretty:
+                json.dump(collection, f, indent=2)
+            else:
+                json.dump(collection, f, separators=(",", ":"))
+    else:
+        with final_output_path.open("w", encoding="utf-8") as f:
+            if pretty:
+                json.dump(collection, f, indent=2)
+            else:
+                json.dump(collection, f, separators=(",", ":"))
+
+    if output_mask is not None:
+        raster_mask = _rasterise_features_to_mask(features, H, W)
+        output_mask.parent.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(str(output_mask), raster_mask)
 
     return len(features)

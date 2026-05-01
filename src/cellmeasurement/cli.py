@@ -236,6 +236,22 @@ def main(
         bool,
         typer.Option("--pretty-json/--no-pretty-json", help="Write indented JSON output."),
     ] = False,
+    gzip_output: Annotated[
+        bool,
+        typer.Option(
+            "--gzip/--no-gzip",
+            help="Write gzip-compressed GeoJSON output (appends .gz when needed).",
+        ),
+    ] = False,
+    output_mask: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Optional TIFF path to export a rasterised label mask from final "
+                "non-overlapping cell geometries."
+            ),
+        ),
+    ] = None,
     constrain_overlaps: Annotated[
         bool,
         typer.Option(
@@ -362,7 +378,11 @@ def main(
             if wc_mask is not None else None
         )
 
-        typer.echo(f"Writing GeoJSON to {output_file}...")
+        geojson_output_path = output_file
+        if gzip_output and not str(geojson_output_path).endswith(".gz"):
+            geojson_output_path = Path(str(geojson_output_path) + ".gz")
+
+        typer.echo(f"Writing GeoJSON to {geojson_output_path}...")
         n_written = write_geojson(
             cells=cells,
             nuc_geoms=nuc_geoms,
@@ -374,8 +394,12 @@ def main(
             measurements_jsonl_path=measurements_jsonl_path,
             constrain_overlaps=constrain_overlaps,
             pretty=pretty_json,
+            gzip_output=gzip_output,
+            output_mask=output_mask,
         )
-        typer.echo(f"Exported {n_written} cell features to {output_file}.")
+        typer.echo(f"Exported {n_written} cell features to {geojson_output_path}.")
+        if output_mask is not None:
+            typer.echo(f"Exported rasterisation mask to {output_mask}.")
     finally:
         for loaded_mask in (nuc_mask, wc_mask):
             if loaded_mask is None:

@@ -436,3 +436,39 @@ def test_main_rejects_nonpositive_dist_threshold(tmp_path):
             measurements=False,
             dist_threshold=0.0,
         )
+
+
+def test_main_passes_gzip_and_rasterisation_flags(monkeypatch, tmp_path):
+    class DummyMask:
+        def __init__(self):
+            self.labels = _one_pixel_labels()
+            self.shape = (1, 1)
+            self.boundaries = None
+            self.temp_store_path = None
+
+        def cleanup_temp_store(self):
+            self.temp_store_path = None
+
+    dummy = DummyMask()
+    writer_args: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
+    monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+
+    def fake_write_geojson(**kwargs):
+        writer_args.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli, "write_geojson", fake_write_geojson)
+
+    cli.main(
+        nuclear_mask=tmp_path / "nuc.tiff",
+        output_file=tmp_path / "out.geojson",
+        measurements=False,
+        gzip_output=True,
+        output_mask=tmp_path / "cells_rasterisation.tiff",
+    )
+
+    assert writer_args["gzip_output"] is True
+    assert writer_args["output_mask"] == tmp_path / "cells_rasterisation.tiff"

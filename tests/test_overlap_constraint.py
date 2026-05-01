@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 import json
 
+import tifffile
 from shapely.geometry import Polygon, shape
 
 from cellmeasurement.io.geojson_writer import write_geojson
@@ -198,3 +200,72 @@ def test_write_geojson_attaches_measurements_from_jsonl(tmp_path: Path):
 
     cell_feature = next(feat for feat in data["features"] if feat["properties"].get("objectType") == "cell")
     assert cell_feature["properties"]["measurements"]["Cell: Area µm^2"] == 4.0
+
+
+def test_write_geojson_gzip_output(tmp_path: Path):
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    out_path = tmp_path / "cells.geojson"
+
+    n = write_geojson(
+        cells=[cell],
+        nuc_geoms=None,
+        wc_geoms={1: Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])},
+        synth_geoms={},
+        output_path=out_path,
+        image_shape=(10, 10),
+        constrain_overlaps=False,
+        gzip_output=True,
+    )
+
+    assert n == 1
+    gz_path = tmp_path / "cells.geojson.gz"
+    assert gz_path.exists()
+    with gzip.open(gz_path, "rt", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["type"] == "FeatureCollection"
+    assert len(data["features"]) == 2
+
+
+def test_write_geojson_rasterisation_output(tmp_path: Path):
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    out_path = tmp_path / "cells.geojson"
+    mask_path = tmp_path / "cells_rasterisation.tiff"
+
+    n = write_geojson(
+        cells=[cell],
+        nuc_geoms=None,
+        wc_geoms={1: Polygon([(2, 2), (5, 2), (5, 5), (2, 5)])},
+        synth_geoms={},
+        output_path=out_path,
+        image_shape=(10, 10),
+        constrain_overlaps=False,
+        output_mask=mask_path,
+    )
+
+    assert n == 1
+    assert mask_path.exists()
+    mask = tifffile.imread(mask_path)
+    assert int(mask.max()) == 1
+    assert int(mask[3, 3]) == 1
