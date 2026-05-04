@@ -3,15 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import math
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence, TextIO
 
 import dask.array as da
 import numpy as np
-import tifffile
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 from shapely.geometry import Polygon
@@ -20,6 +18,7 @@ from skimage.measure import regionprops
 from skimage.morphology import disk
 
 from ..segmentation.cell import CellMatch
+from .image_io import _load_tiff_image
 
 logger = logging.getLogger(__name__)
 
@@ -28,154 +27,6 @@ logger = logging.getLogger(__name__)
 _DISK_1 = disk(1).astype(bool)  # type: ignore[assignment]
 _DISK_1.flags.writeable = False
 _MIN_CIRCULARITY_AREA_PX = 5.0
-
-
-def _normalize_image_cyx(arr: np.ndarray, axes: str | None = None) -> np.ndarray:
-    """Normalize loaded TIFF data to (C, Y, X)."""
-    if axes is not None and len(axes) == arr.ndim:
-        work = np.asarray(arr)
-        axis_list = list(axes)
-
-        # Drop singleton axes not used for channel/spatial dimensions.
-        for idx in range(len(axis_list) - 1, -1, -1):
-            ax = axis_list[idx]
-            if ax in {"C", "S", "Y", "X"}:
-                continue
-            if work.shape[idx] != 1:
-                raise ValueError(
-                    f"Unsupported TIFF layout: non-singleton axis '{ax}' in shape {work.shape} (axes='{axes}')"
-                )
-            work = np.take(work, 0, axis=idx)
-            axis_list.pop(idx)
-
-        channel_axis = axis_list.index("C") if "C" in axis_list else \
-            (axis_list.index("S") if "S" in axis_list else None)
-        if "Y" not in axis_list or "X" not in axis_list:
-            raise ValueError(f"Could not find Y/X axes in TIFF layout (axes='{axes}', shape={arr.shape})")
-        y_axis = axis_list.index("Y")
-        x_axis = axis_list.index("X")
-
-        if channel_axis is None:
-            work = np.transpose(work, (y_axis, x_axis))
-            return work[np.newaxis, ...]
-
-        work = np.transpose(work, (channel_axis, y_axis, x_axis))
-        return work
-
-    # Heuristic fallback when axis metadata is unavailable.
-    if arr.ndim == 2:
-        return arr[np.newaxis, ...]
-    if arr.ndim != 3:
-        raise ValueError(f"Unsupported TIFF image dimensions: shape={arr.shape}")
-    if arr.shape[0] <= arr.shape[1] and arr.shape[0] <= arr.shape[2]:
-        return arr
-    if arr.shape[2] <= arr.shape[0] and arr.shape[2] <= arr.shape[1]:
-        return np.moveaxis(arr, 2, 0)
-    raise ValueError(f"Unsupported 3D TIFF image layout: shape={arr.shape}")
-
-
-def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
-    """Load TIFF intensity image and return (C, Y, X) data with channel names."""
-    axes: str | None = None
-    ch_names: list[str] = []
-    try:
-        with tifffile.TiffFile(path) as tf:
-            if tf.series:
-                axes = tf.series[0].axes
-            ch_names = _extract_channel_names(tf)
-    except Exception:
-        axes = None
-
-    try:
-        arr = tifffile.memmap(path)
-    except (ValueError, OSError, tifffile.TiffFileError, NotImplementedError):
-        logger.warning(
-            "tifffile.memmap failed for %s; falling back to tifffile.imread (higher memory usage).",
-            path,
-        )
-        arr = tifffile.imread(path)
-
-    image_cyx = _normalize_image_cyx(np.asarray(arr), axes=axes)
-    n_channels = int(image_cyx.shape[0])
-    if not ch_names or len(ch_names) != n_channels:
-        if ch_names and len(ch_names) != n_channels:
-            logger.warning(
-                "Found %d channel names but TIFF has %d channels; using fallback names.",
-                len(ch_names),
-                n_channels,
-            )
-        ch_names = [f"Channel {i + 1}" for i in range(n_channels)]
-    return image_cyx, ch_names
-
-
-def _channel_names_from_ome(tf: tifffile.TiffFile) -> list[str]:
-    """Extract channel names from OME-XML metadata when available."""
-    ome_text = tf.ome_metadata
-    if not ome_text and tf.pages:
-        first_desc = tf.pages[0].description
-        if isinstance(first_desc, str) and first_desc.strip().startswith("<"):
-            ome_text = first_desc
-    if not ome_text:
-        return []
-
-    root = ET.fromstring(ome_text)
-    ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
-    channels = root.findall(".//ome:Channel", ns)
-    out = []
-    for ch in channels:
-        name = ch.get("Name") or ch.get("ID") or ""
-        out.append(str(name))
-    return [name for name in out if name]
-
-
-def _channel_names_from_mibi_json(tf: tifffile.TiffFile) -> list[str]:
-    """Extract channel names from per-page MIBI JSON descriptions."""
-    if not tf.pages:
-        return []
-    try:
-        first_desc = tf.pages[0].description
-        if not isinstance(first_desc, str):
-            return []
-        json.loads(first_desc)  # probe JSON format
-        out: list[str] = []
-        for page in tf.pages:
-            desc = page.description
-            if not isinstance(desc, str):
-                return []
-            parsed = json.loads(desc)
-            name = parsed.get("channel.target", "")
-            out.append(str(name))
-        return [name for name in out if name]
-    except (ValueError, TypeError, AttributeError):
-        return []
-
-
-def _channel_names_from_imagej(tf: tifffile.TiffFile) -> list[str]:
-    """Extract channel names from ImageJ Labels metadata."""
-    ij = tf.imagej_metadata
-    if not ij or "Labels" not in ij:
-        return []
-    return [str(lbl) for lbl in ij["Labels"] if str(lbl)]
-
-
-def _extract_channel_names(tf: tifffile.TiffFile) -> list[str]:
-    """Extract channel names using OME, MIBI JSON, then ImageJ metadata strategies."""
-    try:
-        names = _channel_names_from_ome(tf)
-        if names:
-            return names
-    except Exception as exc:
-        logger.debug("Failed OME channel extraction: %s", exc)
-
-    names = _channel_names_from_mibi_json(tf)
-    if names:
-        return names
-
-    names = _channel_names_from_imagej(tf)
-    if names:
-        return names
-
-    return []
 
 
 def _largest_region(mask: np.ndarray):
@@ -279,11 +130,26 @@ def _add_intensity_measurements(
     ch_names: Sequence[str],
     comp_masks: dict[str, np.ndarray],
 ) -> None:
-    """Populate standard intensity summary stats for each channel and compartment."""
+    """Populate baseline intensity stats for each channel/compartment pair.
+
+    This is the core "QuPath-style" measurement block used by downstream tools:
+    for each channel and each compartment mask we compute Mean/Median/Min/Max/
+    Std.Dev. and store keys in the form:
+
+    ``"<channel>: <Compartment>: <Stat>"``.
+
+    Notes
+    -----
+    - ``comp_masks`` is expected to come from :func:`_compartment_masks`, so
+      masks are already aligned to ``image_cyx`` spatial coordinates.
+    - Empty compartments are skipped to avoid adding misleading zero-valued
+      summary statistics for absent regions.
+    """
     labels = {"CELL": "Cell", "NUCLEUS": "Nucleus", "CYTOPLASM": "Cytoplasm", "MEMBRANE": "Membrane"}
     for ci, ch in enumerate(ch_names):
         ch_img = image_cyx[ci]
         for comp, mask in comp_masks.items():
+            # Boolean indexing flattens selected pixels to 1-D values for stats.
             vals = ch_img[mask]
             if vals.size == 0:
                 continue
@@ -298,7 +164,16 @@ def _add_percentiles(
     comp_masks: dict[str, np.ndarray],
     percentiles: Sequence[float],
 ) -> None:
-    """Populate configured percentiles for each channel and compartment."""
+    """Populate user-requested percentiles for each channel/compartment pair.
+
+    Percentiles complement the fixed summary stats from
+    :func:`_add_intensity_measurements` by exposing distribution shape (e.g.
+    tails and skew). Keys are emitted as:
+
+    ``"<channel>: <Compartment>: Percentile: <p>"``.
+
+    ``percentiles`` is expected to be pre-parsed/validated at CLI boundary.
+    """
     if not percentiles:
         return
     labels = {"CELL": "Cell", "NUCLEUS": "Nucleus", "CYTOPLASM": "Cytoplasm", "MEMBRANE": "Membrane"}
@@ -353,7 +228,18 @@ def _add_erosion_measurements(
     comp_masks: dict[str, np.ndarray],
     n_bins: int = 5,
 ) -> None:
-    """Populate per-bin erosion area/depth and channel intensity measurements."""
+    """Populate equal-area inward erosion-bin measurements for cell and nucleus.
+
+    The compartment is split into ``n_bins`` concentric shells from outside in.
+    Bin boundaries are adaptive (equal-area targets), not fixed pixel depths.
+
+    For each bin we emit:
+    - geometric descriptors (``Area_px``, ``Area_Fraction``, ``Depth_px``)
+    - per-channel mean/median intensity inside that bin shell
+
+    ``Depth_px`` is cumulative erosion depth at the *inner* edge of the bin,
+    mirroring the historical llm_rewrite semantics.
+    """
     for comp in ("CELL", "NUCLEUS"):
         base = comp_masks[comp]
         base_area = int(np.count_nonzero(base))
@@ -362,6 +248,7 @@ def _add_erosion_measurements(
 
         comp_name = comp.capitalize()
         bin_boundaries = _erosion_bins_for_mask(base, n_bins=n_bins)
+        # Boundaries are cumulative masks; convert to mutually exclusive rings.
         prev_mask = base.astype(bool)
         for bin_idx, (eroded_mask, depth_px) in enumerate(bin_boundaries, start=1):
             ring = prev_mask & ~eroded_mask
@@ -427,7 +314,14 @@ def _add_expansion_measurements(
     pixel_size_microns: float,
     n_bins: int = 5,
 ) -> None:
-    """Populate per-bin expansion area/depth and channel intensity measurements."""
+    """Populate equal-area outward expansion-bin measurements for cell body.
+
+    A fixed physical radius (20 µm) is converted to pixels using
+    ``pixel_size_microns`` (already effective/scaled by any downsampling), then
+    partitioned into ``n_bins`` approximately equal-area annular shells.
+
+    Emitted keys mirror erosion naming but use ``ExpansionBin_<N>``.
+    """
     expansion_um = 20.0
     total_expansion_px = max(1, int(round(expansion_um / pixel_size_microns)))
 
@@ -440,6 +334,7 @@ def _add_expansion_measurements(
     if not bin_boundaries:
         return
 
+    # As with erosion: cumulative boundaries -> disjoint annular ring bins.
     prev_mask = cm.copy()
     for bin_idx, (dilated_mask, depth_px) in enumerate(bin_boundaries, start=1):
         ring = dilated_mask & ~prev_mask
@@ -466,7 +361,12 @@ def _add_environment_measurements(
     cell_mask: np.ndarray,
     pixel_size_microns: float,
 ) -> None:
-    """Populate 20 µm pericellular environment measurements."""
+    """Populate single-zone 20 µm pericellular environment measurements.
+
+    Unlike :func:`_add_expansion_measurements` (which yields multiple bins),
+    this computes one aggregate environment compartment covering the full
+    20 µm ring outside the cell boundary.
+    """
     environment_um = 20.0
     expansion_px = max(1, int(round(environment_um / pixel_size_microns)))
     cm = cell_mask.astype(bool)
@@ -483,6 +383,7 @@ def _add_environment_measurements(
     props["Cell: Environment_20um: Pixel_Count"] = float(env_area)
     props["Cell: Environment_20um: Area_Fraction"] = float(env_area / base_area) if base_area > 0 else 0.0
     for ci, ch in enumerate(ch_names):
+        # Keep the same stat family as base compartment metrics for consistency.
         vals = image_cyx[ci][env_mask]
         if vals.size == 0:
             continue
@@ -725,30 +626,21 @@ def _measure_tile(
     return results, fallback_reads
 
 
-def _add_neighbour_measurements(
+def _ordered_measurement_cell_ids(
     measurements_by_cell: dict[int, dict[str, float]],
     cells: Sequence[CellMatch],
-    neighbours: int,
-    pixel_size_microns: float,
-) -> None:
-    """Aggregate numeric measurements over k nearest neighbours within a 20 µm cap."""
-    if neighbours <= 0 or len(measurements_by_cell) < 2:
-        return
-
+) -> tuple[list[int], dict[int, tuple[float, float]]]:
+    """Return measurement cell IDs that have centroids, in deterministic order."""
     centroid_by_cell: dict[int, tuple[float, float]] = {cell.cell_id: cell.centroid for cell in cells}
     ordered_ids = [cid for cid in sorted(measurements_by_cell) if cid in centroid_by_cell]
-    if len(ordered_ids) < 2:
-        return
+    return ordered_ids, centroid_by_cell
 
-    max_distance_px = 20.0 / pixel_size_microns
-    centroids = np.array([centroid_by_cell[cid] for cid in ordered_ids], dtype=np.float64)
-    tree = cKDTree(centroids)
-    actual_k = min(neighbours + 1, len(ordered_ids))
-    if actual_k <= 1:
-        return
 
-    distances, indices = tree.query(centroids, k=actual_k)
-
+def _collect_numeric_measurement_keys(
+    measurements_by_cell: dict[int, dict[str, float]],
+    ordered_ids: Sequence[int],
+) -> set[str]:
+    """Return base numeric measurement keys eligible for neighbour aggregation."""
     numeric_keys: set[str] = set()
     for cell_id in ordered_ids:
         for key, value in measurements_by_cell[cell_id].items():
@@ -758,9 +650,15 @@ def _add_neighbour_measurements(
                 continue
             if isinstance(value, (int, float, np.integer, np.floating)):
                 numeric_keys.add(key)
-    if not numeric_keys:
-        return
+    return numeric_keys
 
+
+def _build_measurement_key_vectors(
+    measurements_by_cell: dict[int, dict[str, float]],
+    ordered_ids: Sequence[int],
+    numeric_keys: set[str],
+) -> dict[str, np.ndarray]:
+    """Build dense vectors (cell-aligned) for each numeric measurement key."""
     key_vectors: dict[str, np.ndarray] = {}
     for key in numeric_keys:
         arr = np.full(len(ordered_ids), np.nan, dtype=np.float64)
@@ -771,6 +669,58 @@ def _add_neighbour_measurements(
             if isinstance(value, (int, float, np.integer, np.floating)):
                 arr[i] = float(value)
         key_vectors[key] = arr
+    return key_vectors
+
+
+def _query_neighbour_indices(
+    ordered_ids: Sequence[int],
+    centroid_by_cell: dict[int, tuple[float, float]],
+    neighbours: int,
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+    """Query k-nearest neighbours in centroid space."""
+    if len(ordered_ids) < 2:
+        return None
+
+    centroids = np.array([centroid_by_cell[cid] for cid in ordered_ids], dtype=np.float64)
+    tree = cKDTree(centroids)
+    actual_k = min(neighbours + 1, len(ordered_ids))
+    if actual_k <= 1:
+        return None
+
+    distances, indices = tree.query(centroids, k=actual_k)
+    return np.asarray(distances, dtype=np.float64), np.asarray(indices, dtype=np.int64), actual_k
+
+
+def _add_neighbour_measurements(
+    measurements_by_cell: dict[int, dict[str, float]],
+    cells: Sequence[CellMatch],
+    neighbours: int,
+    pixel_size_microns: float,
+) -> None:
+    """Aggregate each cell's numeric metrics over k nearest neighbours.
+
+    Neighbours are selected in centroid space with a hard 20 µm distance cap
+    (converted to pixels via ``pixel_size_microns``), then aggregated per key.
+    Current behaviour intentionally writes mean-only neighbour summaries:
+
+    ``Neighbours: Mean: <original measurement key>``.
+    """
+    if neighbours <= 0 or len(measurements_by_cell) < 2:
+        return
+
+    ordered_ids, centroid_by_cell = _ordered_measurement_cell_ids(measurements_by_cell, cells)
+    query = _query_neighbour_indices(ordered_ids, centroid_by_cell, neighbours)
+    if query is None:
+        return
+    distances, indices, actual_k = query
+    max_distance_px = 20.0 / pixel_size_microns
+    numeric_keys = _collect_numeric_measurement_keys(measurements_by_cell, ordered_ids)
+    if not numeric_keys:
+        return
+
+    # Build one dense vector per measurement key so each cell can aggregate
+    # neighbours by fast index selection instead of repeated dict lookups.
+    key_vectors = _build_measurement_key_vectors(measurements_by_cell, ordered_ids, numeric_keys)
 
     for i, cell_id in enumerate(ordered_ids):
         neighbour_idx = np.asarray(indices[i, 1:actual_k], dtype=np.int64)
@@ -796,6 +746,142 @@ def _write_measurement_jsonl_row(
     """Write one `{cell_id, measurements}` record as JSONL."""
     json.dump({"cell_id": cell_id, "measurements": measurements}, fh, separators=(",", ":"))
     fh.write("\n")
+
+
+def _validate_measure_cells_inputs(neighbours: int, downsample_factor: float) -> None:
+    """Validate public input arguments for tiled measurement."""
+    if neighbours < 0:
+        raise ValueError("neighbours must be >= 0")
+    if downsample_factor <= 0:
+        raise ValueError("downsample_factor must be > 0")
+
+
+def _prepare_measurement_image_and_masks(
+    tiff_file: Path,
+    image_shape: tuple[int, int],
+    nuc_labels: da.Array | None,
+    wc_labels: da.Array | None,
+    pixel_size_microns: float,
+    downsample_factor: float,
+) -> tuple[np.ndarray, list[str], da.Array | np.ndarray | None, da.Array | np.ndarray | None, float]:
+    """Load TIFF image and apply optional downsampling to image/masks."""
+    loaded_image_cyx, ch_names = _load_tiff_image(tiff_file)
+    if loaded_image_cyx.shape[1:] != image_shape:
+        raise ValueError(
+            f"TIFF image shape {tuple(loaded_image_cyx.shape[1:])} does not match segmentation shape {image_shape}."
+        )
+
+    effective_pixel_size = pixel_size_microns
+    if downsample_factor > 1.0:
+        from ..io.image_loading import maybe_downsample
+
+        step = int(round(downsample_factor))
+        if step >= 2:
+            nuc_np = None if nuc_labels is None else np.asarray(nuc_labels)
+            wc_np = np.asarray(wc_labels)
+
+            loaded_image_cyx, nuc_ds, wc_ds = maybe_downsample(loaded_image_cyx, nuc_np, wc_np, downsample_factor)
+            nuc_labels = nuc_ds
+            wc_labels = wc_ds
+            effective_pixel_size = pixel_size_microns * step
+            logger.info(
+                "Applied downsampling factor %.1f to image and masks; effective pixel size now %.2f µm",
+                downsample_factor,
+                effective_pixel_size,
+            )
+
+    return loaded_image_cyx, ch_names, nuc_labels, wc_labels, effective_pixel_size
+
+
+def _tile_measure_kwargs(
+    *,
+    image_cyx: np.ndarray,
+    ch_names: Sequence[str],
+    nuc_labels: da.Array | np.ndarray | None,
+    wc_labels: da.Array | np.ndarray | None,
+    image_shape: tuple[int, int],
+    tile_size: int,
+    tile_overlap: int,
+    synth_geoms: dict[int, Polygon],
+    percentiles: Sequence[float],
+    erosion_enabled: bool,
+    expansion_enabled: bool,
+    environment_expansion_enabled: bool,
+    pixel_size_microns: float,
+) -> dict[str, object]:
+    """Build kwargs passed unchanged to each tile measurement task."""
+    return {
+        "image_cyx": image_cyx,
+        "ch_names": ch_names,
+        "nuc_labels": nuc_labels,
+        "wc_labels": wc_labels,
+        "image_shape": image_shape,
+        "tile_size": tile_size,
+        "tile_overlap": tile_overlap,
+        "synth_geoms": synth_geoms,
+        "percentiles": percentiles,
+        "erosion_enabled": erosion_enabled,
+        "expansion_enabled": expansion_enabled,
+        "environment_expansion_enabled": environment_expansion_enabled,
+        "pixel_size_microns": pixel_size_microns,
+    }
+
+
+def _iter_tile_measurements(
+    tile_groups: dict[tuple[int, int], list[CellMatch]],
+    threads: int,
+    tile_kwargs: dict[str, object],
+) -> Iterator[tuple[dict[int, dict[str, float]], int]]:
+    """Yield measured tile results in serial or parallel mode."""
+    if threads <= 1 or len(tile_groups) <= 1:
+        for key, group in tile_groups.items():
+            yield _measure_tile(tile_key=key, tile_cells=group, **tile_kwargs)
+        return
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = [
+            executor.submit(_measure_tile, tile_key=key, tile_cells=group, **tile_kwargs)
+            for key, group in tile_groups.items()
+        ]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def _flush_stream_rows(
+    stream_fh: TextIO | None,
+    stream_pending: dict[int, dict[str, float]],
+    next_stream_id: int,
+    tile_result: dict[int, dict[str, float]],
+) -> int:
+    """Flush in-order JSONL rows from accumulated tile results."""
+    if stream_fh is None:
+        return next_stream_id
+    stream_pending.update(tile_result)
+    while next_stream_id in stream_pending:
+        _write_measurement_jsonl_row(stream_fh, next_stream_id, stream_pending.pop(next_stream_id))
+        next_stream_id += 1
+    return next_stream_id
+
+
+def _finalize_stream(
+    stream_fh: TextIO | None,
+    *,
+    needs_neighbour_aggregation: bool,
+    cells: Sequence[CellMatch],
+    results: dict[int, dict[str, float]],
+    stream_pending: dict[int, dict[str, float]],
+) -> None:
+    """Write final pending rows and close JSONL stream if open."""
+    if stream_fh is None:
+        return
+    if needs_neighbour_aggregation:
+        for cell in sorted(cells, key=lambda c: c.cell_id):
+            _write_measurement_jsonl_row(stream_fh, cell.cell_id, results.get(cell.cell_id, {}))
+    else:
+        # Flush any unresolved IDs (e.g. non-contiguous id sets).
+        for cell_id in sorted(stream_pending):
+            _write_measurement_jsonl_row(stream_fh, cell_id, stream_pending[cell_id])
+    stream_fh.close()
 
 
 def measure_cells_tiled(
@@ -884,33 +970,16 @@ def measure_cells_tiled(
     """
     if not cells:
         return {}
-    if neighbours < 0:
-        raise ValueError("neighbours must be >= 0")
-    if downsample_factor <= 0:
-        raise ValueError("downsample_factor must be > 0")
+    _validate_measure_cells_inputs(neighbours, downsample_factor)
 
-    image_cyx, ch_names = _load_tiff_image(tiff_file)
-    if image_cyx.shape[1:] != image_shape:
-        raise ValueError(
-            f"TIFF image shape {tuple(image_cyx.shape[1:])} does not match segmentation shape {image_shape}."
-        )
-
-    # Apply optional downsampling to image and label masks
-    effective_pixel_size = pixel_size_microns
-    if downsample_factor > 1.0:
-        from ..io.image_loading import maybe_downsample
-
-        step = int(round(downsample_factor))
-        if step >= 2:
-            nuc_np = None if nuc_labels is None else np.asarray(nuc_labels)
-            wc_np = np.asarray(wc_labels)
-
-            image_cyx, nuc_ds, wc_ds = maybe_downsample(image_cyx, nuc_np, wc_np, downsample_factor)
-
-            nuc_labels = nuc_ds
-            wc_labels = wc_ds
-            effective_pixel_size = pixel_size_microns * step
-            logger.info("Applied downsampling factor %.1f to image and masks; effective pixel size now %.2f µm", downsample_factor, effective_pixel_size)
+    image_cyx, ch_names, nuc_labels, wc_labels, effective_pixel_size = _prepare_measurement_image_and_masks(
+        tiff_file=tiff_file,
+        image_shape=image_shape,
+        nuc_labels=nuc_labels,
+        wc_labels=wc_labels,
+        pixel_size_microns=pixel_size_microns,
+        downsample_factor=downsample_factor,
+    )
 
     tile_groups = _group_cells_by_tile(cells, tile_size=tile_size)
     needs_neighbour_aggregation = neighbours > 0
@@ -918,77 +987,35 @@ def measure_cells_tiled(
     results: dict[int, dict[str, float]] = {}
     stream_pending: dict[int, dict[str, float]] = {}
     next_stream_id = min(cell.cell_id for cell in cells)
-    stream_fh = None
+    stream_fh: TextIO | None = None
     if jsonl_path is not None:
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         stream_fh = jsonl_path.open("w", encoding="utf-8")
 
-    def _flush_stream_rows(tile_result: dict[int, dict[str, float]]) -> None:
-        nonlocal next_stream_id
-        if stream_fh is None:
-            return
-        stream_pending.update(tile_result)
-        while next_stream_id in stream_pending:
-            _write_measurement_jsonl_row(stream_fh, next_stream_id, stream_pending.pop(next_stream_id))
-            next_stream_id += 1
-
+    tile_kwargs = _tile_measure_kwargs(
+        image_cyx=image_cyx,
+        ch_names=ch_names,
+        nuc_labels=nuc_labels,
+        wc_labels=wc_labels,
+        image_shape=image_shape,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        synth_geoms=synth_geoms,
+        percentiles=percentiles,
+        erosion_enabled=erosion_enabled,
+        expansion_enabled=expansion_enabled,
+        environment_expansion_enabled=environment_expansion_enabled,
+        pixel_size_microns=effective_pixel_size,
+    )
     fallback_reads = 0
 
     try:
-        if threads <= 1 or len(tile_groups) <= 1:
-            for key, group in tile_groups.items():
-                tile_result, tile_fallback = _measure_tile(
-                    tile_key=key,
-                    tile_cells=group,
-                    image_cyx=image_cyx,
-                    ch_names=ch_names,
-                    nuc_labels=nuc_labels,
-                    wc_labels=wc_labels,
-                    image_shape=image_shape,
-                    tile_size=tile_size,
-                    tile_overlap=tile_overlap,
-                    synth_geoms=synth_geoms,
-                    percentiles=percentiles,
-                    erosion_enabled=erosion_enabled,
-                    expansion_enabled=expansion_enabled,
-                    environment_expansion_enabled=environment_expansion_enabled,
-                    pixel_size_microns=effective_pixel_size,
-                )
-                if collect_results:
-                    results.update(tile_result)
-                if not needs_neighbour_aggregation:
-                    _flush_stream_rows(tile_result)
-                fallback_reads += tile_fallback
-        else:
-            with ThreadPoolExecutor(max_workers=threads) as executor:
-                future_map = {
-                    executor.submit(
-                        _measure_tile,
-                        key,
-                        group,
-                        image_cyx,
-                        ch_names,
-                        nuc_labels,
-                        wc_labels,
-                        image_shape,
-                        tile_size,
-                        tile_overlap,
-                        synth_geoms,
-                        percentiles,
-                        erosion_enabled,
-                        expansion_enabled,
-                        environment_expansion_enabled,
-                        effective_pixel_size,
-                    ): key
-                    for key, group in tile_groups.items()
-                }
-                for future in as_completed(future_map):
-                    tile_result, tile_fallback = future.result()
-                    if collect_results:
-                        results.update(tile_result)
-                    if not needs_neighbour_aggregation:
-                        _flush_stream_rows(tile_result)
-                    fallback_reads += tile_fallback
+        for tile_result, tile_fallback in _iter_tile_measurements(tile_groups, threads, tile_kwargs):
+            if collect_results:
+                results.update(tile_result)
+            if not needs_neighbour_aggregation:
+                next_stream_id = _flush_stream_rows(stream_fh, stream_pending, next_stream_id, tile_result)
+            fallback_reads += tile_fallback
 
         if needs_neighbour_aggregation:
             _add_neighbour_measurements(
@@ -998,15 +1025,13 @@ def measure_cells_tiled(
                 pixel_size_microns=effective_pixel_size,
             )
     finally:
-        if stream_fh is not None:
-            if needs_neighbour_aggregation:
-                for cell in sorted(cells, key=lambda c: c.cell_id):
-                    _write_measurement_jsonl_row(stream_fh, cell.cell_id, results.get(cell.cell_id, {}))
-            else:
-                # Flush any unresolved IDs (e.g. non-contiguous id sets).
-                for cell_id in sorted(stream_pending):
-                    _write_measurement_jsonl_row(stream_fh, cell_id, stream_pending[cell_id])
-            stream_fh.close()
+        _finalize_stream(
+            stream_fh,
+            needs_neighbour_aggregation=needs_neighbour_aggregation,
+            cells=cells,
+            results=results,
+            stream_pending=stream_pending,
+        )
 
     if fallback_reads > 0:
         logger.info("Tile measurement fallback direct bbox reads: %d", fallback_reads)
