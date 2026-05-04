@@ -421,3 +421,47 @@ def test_measure_cells_tiled_streams_jsonl_with_neighbours(tmp_path: Path):
     assert payloads
     first_measurements = payloads[0]["measurements"]
     assert "Neighbours: Mean: Cell: Area µm^2" in first_measurements
+
+
+def test_measure_cells_tiled_clips_circularity_and_filters_tiny_objects(tmp_path: Path):
+    img = np.ones((7, 7), dtype=np.uint16)
+    tiff_path = tmp_path / "img_circularity.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((7, 7), dtype=np.uint32)
+    wc[1:6, 1:6] = 1
+    nuc = np.zeros((7, 7), dtype=np.uint32)
+    # Thin 3-pixel nucleus shape that can produce unstable circularity with pixel perimeter.
+    nuc[3, 2:5] = 1
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=1,
+        whole_cell_label=1,
+        bbox=(1, 1, 6, 6),
+        centroid=(3.0, 3.0),
+        nucleus_area_px=3,
+        cell_area_px=25,
+        overlap_px=3,
+        overlap_fraction=1.0,
+        match_source="overlap_1to1",
+    )
+
+    measured = measure_cells_tiled(
+        cells=[cell],
+        nuc_labels=da.from_array(nuc, chunks=(7, 7)),
+        wc_labels=da.from_array(wc, chunks=(7, 7)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(7, 7),
+        tile_size=7,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+
+    props = measured[1]
+    assert 0.0 <= props["Cell: Circularity"] <= 1.0
+    assert 0.0 <= props["Nucleus: Circularity"] <= 1.0
+    assert props["Nucleus: Circularity"] == 0.0

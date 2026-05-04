@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # morphological erosion/dilation operations.  Frozen to prevent accidental mutation.
 _DISK_1 = disk(1).astype(bool)  # type: ignore[assignment]
 _DISK_1.flags.writeable = False
+_MIN_CIRCULARITY_AREA_PX = 5.0
 
 
 def _normalize_image_cyx(arr: np.ndarray, axes: str | None = None) -> np.ndarray:
@@ -199,6 +200,14 @@ def _axis_minor_length(region: object) -> float:
     return float(getattr(region, "minor_axis_length"))
 
 
+def _clipped_circularity(area_px: float, perimeter_px: float, min_area_px: float = _MIN_CIRCULARITY_AREA_PX) -> float:
+    """Compute circularity with clipping and tiny-object filtering."""
+    if area_px < min_area_px or perimeter_px <= 0:
+        return 0.0
+    raw = float(4 * math.pi * area_px / (perimeter_px**2))
+    return float(np.clip(raw, 0.0, 1.0))
+
+
 def _basic_shape_metrics(
     cell_mask: np.ndarray,
     nuc_mask: np.ndarray,
@@ -212,10 +221,10 @@ def _basic_shape_metrics(
     px_to_um = float(pixel_size_microns)
     area_scale = px_to_um**2
     perimeter = float(r.perimeter) if r.perimeter > 0 else 0.0
-    circularity = float(4 * math.pi * r.area / (r.perimeter**2)) if r.perimeter > 0 else 0.0
+    cell_area_px = float(r.area)
+    circularity = _clipped_circularity(cell_area_px, perimeter)
     major_px = _axis_major_length(r)
     minor_px = _axis_minor_length(r)
-    cell_area_px = float(r.area)
     out: dict[str, float] = {
         "Cell: Area µm^2": cell_area_px * area_scale,
         "Cell: Circularity": circularity,
@@ -232,7 +241,7 @@ def _basic_shape_metrics(
         n_major_px = _axis_major_length(nr)
         n_minor_px = _axis_minor_length(nr)
         out["Nucleus: Area µm^2"] = n_area_px * area_scale
-        out["Nucleus: Circularity"] = float(4 * math.pi * nr.area / (nr.perimeter**2)) if nr.perimeter > 0 else 0.0
+        out["Nucleus: Circularity"] = _clipped_circularity(n_area_px, n_perimeter_px)
         out["Nucleus: Length µm"] = n_perimeter_px * px_to_um
         out["Nucleus: Max diameter µm"] = n_major_px * px_to_um
         out["Nucleus: Min diameter µm"] = n_minor_px * px_to_um
