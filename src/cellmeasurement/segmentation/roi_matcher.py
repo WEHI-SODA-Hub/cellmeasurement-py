@@ -214,7 +214,7 @@ def match_rois(
 
     # --- Synthesis for unmatched nuclei ---
     unmatched_nuc = set(nuc_stats.keys()) - matched_nuc
-    synth, synth_geoms, _ = _synthesis_pass(
+    synth, synth_geoms, _, dropped_synth_cells = _synthesis_pass(
         unmatched_nuc,
         matched_wc,
         nuc_labels,
@@ -225,7 +225,11 @@ def match_rois(
         W,
         next_id,
     )
-    logger.info("Synthesised boundaries for %d unmatched nuclei", len(synth))
+    logger.info(
+        "Synthesised boundaries for %d unmatched nuclei (dropped=%d)",
+        len(synth),
+        dropped_synth_cells,
+    )
 
     return matches + synth, synth_geoms
 
@@ -585,7 +589,7 @@ def _synthesis_pass(
     H: int,
     W: int,
     next_id: int,
-) -> tuple[list[CellMatch], dict[CellId, Polygon], int]:
+) -> tuple[list[CellMatch], dict[CellId, Polygon], int, int]:
     """Synthesise whole-cell boundaries for unmatched nuclei via watershed.
 
     Nuclei are expanded into pixels not already claimed by a matched whole-cell
@@ -598,9 +602,10 @@ def _synthesis_pass(
         * Dict mapping ``cell_id`` to Shapely Polygon in global image
           coordinates for every synthesised cell.
         * Updated ``next_id`` counter.
+        * Number of unmatched nuclei dropped because watershed yielded no pixels.
     """
     if not unmatched_nuc_ids:
-        return [], {}, next_id
+        return [], {}, next_id, 0
 
     pad = max(1, int(np.ceil(estimate_cell_boundary_dist)))
     all_row_min = min(nuc_stats[n]["row_min"] for n in unmatched_nuc_ids)
@@ -642,7 +647,7 @@ def _synthesis_pass(
     ws_result = watershed(dist_map, markers=seeds, mask=growth_zone)
 
     # Release large intermediate arrays before polygon extraction.
-    del dist_map, growth_zone, wc_region
+    del dist_map, wc_region
     gc.collect()
 
     # find_objects returns one slice per label (index = local_id - 1).
@@ -650,13 +655,14 @@ def _synthesis_pass(
 
     synth: list[CellMatch] = []
     synth_geoms: dict[CellId, Polygon] = {}
+    dropped_synth_cells = 0
 
     for local_id, (nuc_id, cid) in enumerate(local_map, start=1):
         idx = local_id - 1
         sl = obj_slices[idx] if idx < len(obj_slices) else None
 
         if sl is not None:
-            sub_mask: npt.NDArray[np.bool_] = ws_result[sl] == local_id
+            sub_mask: npt.NDArray[np.bool_] = (ws_result[sl] == local_id) & growth_zone[sl]
             row_off_local: int = sl[0].start
             col_off_local: int = sl[1].start
         else:
@@ -665,18 +671,7 @@ def _synthesis_pass(
             col_off_local = 0
 
         if not sub_mask.any():
-            # No expansion room — fall back to nucleus footprint in local coords.
-            ns = nuc_stats[nuc_id]
-            nr0 = max(0, ns["row_min"] - r0)
-            nr1 = min(nuc_region.shape[0], ns["row_max"] - r0 + 1)
-            nc0 = max(0, ns["col_min"] - c0)
-            nc1 = min(nuc_region.shape[1], ns["col_max"] - c0 + 1)
-            nuc_crop = nuc_region[nr0:nr1, nc0:nc1]
-            sub_mask = nuc_crop == nuc_id
-            row_off_local = nr0
-            col_off_local = nc0
-
-        if not sub_mask.any():
+            dropped_synth_cells += 1
             continue
 
         poly = mask_to_geometry(
@@ -719,7 +714,7 @@ def _synthesis_pass(
         synth_geoms[cid] = poly
 
     # Release remaining synthesis workspace.
-    del nuc_region, seeds, ws_result
+    del nuc_region, seeds, ws_result, growth_zone
     gc.collect()
 
-    return synth, synth_geoms, next_id
+    return synth, synth_geoms, next_id, dropped_synth_cells

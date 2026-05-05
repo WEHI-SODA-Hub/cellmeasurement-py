@@ -51,6 +51,17 @@ WC_CONFLICT = np.array(
     [[10, 10, 10, 10], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int32
 )
 
+NUC_NO_WATERSHED_PIXELS = np.array(
+    [
+        [0, 1, 0, 2, 0],
+        [0, 1, 0, 2, 0],
+        [0, 0, 0, 0, 0],
+    ],
+    dtype=np.int32,
+)
+
+WC_NO_WATERSHED_PIXELS = np.full((3, 5), 10, dtype=np.int32)
+
 
 # ---------------------------------------------------------------------------
 # _label_stats_chunk
@@ -300,6 +311,18 @@ class TestMatchRois:
         cells, _ = match_rois(nuc, wc, estimate_cell_boundary_dist=1.0)
         overlap = [c for c in cells if c.match_source == "overlap_1to1"]
         assert len(overlap) == 1
+
+    def test_unmatched_nucleus_dropped_when_watershed_has_no_pixels(self):
+        nuc = _make_da(NUC_NO_WATERSHED_PIXELS)
+        wc = _make_da(WC_NO_WATERSHED_PIXELS)
+
+        cells, synth_geoms = match_rois(nuc, wc, estimate_cell_boundary_dist=1.0)
+
+        overlap = [c for c in cells if c.match_source == "overlap_1to1"]
+        synth = [c for c in cells if c.match_source == "watershed_synth"]
+        assert len(overlap) == 1
+        assert len(synth) == 0
+        assert synth_geoms == {}
 
     def test_distance_threshold_matches_non_overlapping_nearby_pair(self):
         nuc = np.array(
