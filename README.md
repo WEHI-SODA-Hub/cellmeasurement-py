@@ -101,10 +101,13 @@ uv run cellmeasurement \
 
 ## Key options
 
-| Option                                               | Description                                   | Default                    |
-|------------------------------------------------------|-----------------------------------------------|----------------------------|
-| `--nuclear-mask PATH`                                | Nuclear segmentation mask (zarr or TIFF)      | `None`                     |
-| `--whole-cell-mask PATH`                             | Whole-cell segmentation mask (zarr or TIFF)   | `None`                     |
+| Option                                               | Description                                    | Default                    |
+|------------------------------------------------------|------------------------------------------------|----------------------------|
+| `--nuclear-mask PATH`                                | Nuclear segmentation mask (zarr or TIFF)       | `None`                     |
+| `--whole-cell-mask PATH`                             | Whole-cell segmentation mask (zarr or TIFF)    | `None`                     |
+| `--parquet-path TEXT`                                | Relative parquet path for zarr boundary shapes | `shapes/cellpose_boundaries/shapes.parquet` |
+| `--temp-dir PATH`                                    | Parent directory for temporary TIFF→zarr       | `None`                     |
+| `--keep-temp-zarr / --no-keep-temp-zarr`             | Keep/delete temporary TIFF-converted zarr      | `--no-keep-temp-zarr`      |
 | `--tiff-file PATH`                                   | Multi-channel TIFF used for measurements       | `None`                     |
 | `--output-file PATH`                                 | GeoJSON output path                            | `cellmeasurement.geojson`  |
 | `--measurements / --no-measurements`                 | Enable/disable measurements                    | `--measurements`           |
@@ -112,6 +115,9 @@ uv run cellmeasurement \
 | `--estimate-cell-boundary-dist FLOAT`                | Watershed expansion radius for unmatched nucs  | `3.0`                      |
 | `--pixel-size-microns FLOAT`                         | Pixel size for µm scaling and 20 µm features   | `0.5`                      |
 | `--downsample-factor FLOAT`                          | Optional image/mask downsampling factor        | `1.0`                      |
+| `--tile-size INT`                                    | Tile size (px) for measurement image reads     | `2048`                     |
+| `--tile-overlap INT`                                 | Tile overlap (px) for measurement reads        | `200`                      |
+| `--threads INT`                                      | Number of tile workers for measurements        | `1`                        |
 | `--erosion-steps / --no-erosion-steps`               | Equal-area erosion-bin measurements            | `--erosion-steps`          |
 | `--expansion-steps / --no-expansion-steps`           | Equal-area 20 µm expansion-bin measurements    | `--expansion-steps`        |
 | `--environment-expansion / --no-environment-expansion` | 20 µm environment compartment measurements   | `--no-environment-expansion` |
@@ -120,6 +126,8 @@ uv run cellmeasurement \
 | `--gzip / --no-gzip`                                 | Write `.geojson.gz` output                     | `--no-gzip`                |
 | `--output-mask PATH`                                 | Optional rasterised label-mask TIFF output     | `None`                     |
 | `--simplify-rois / --no-simplify-rois`               | Douglas-Peucker polygon simplification         | `--simplify-rois`          |
+| `--tolerance FLOAT`                                  | Polygon simplification tolerance (px)          | `0.5`                      |
+| `--pretty-json / --no-pretty-json`                   | Write pretty-printed GeoJSON                   | `--no-pretty-json`         |
 | `--constrain-overlaps / --no-constrain-overlaps`     | Clip overlapping output polygons               | `--constrain-overlaps`     |
 
 ## Performance notes
