@@ -99,7 +99,7 @@ uv run cellmeasurement \
   --output-mask /abs/path/out_labels.tiff
 ```
 
-## Key options
+## Parameters
 
 | Option                                               | Description                                    | Default                    |
 |------------------------------------------------------|------------------------------------------------|----------------------------|
@@ -129,6 +129,7 @@ uv run cellmeasurement \
 | `--tolerance FLOAT`                                  | Polygon simplification tolerance (px)          | `0.5`                      |
 | `--pretty-json / --no-pretty-json`                   | Write pretty-printed GeoJSON                   | `--no-pretty-json`         |
 | `--constrain-overlaps / --no-constrain-overlaps`     | Clip overlapping output polygons               | `--constrain-overlaps`     |
+| `--version`                                          | Print CLI version and exit                     | `False`                    |
 
 ## Performance notes
 

@@ -8,13 +8,22 @@ import numpy as np
 import pytest
 import typer
 from shapely.geometry import Polygon
+from typer.testing import CliRunner
 
 from cellmeasurement import cli
 from cellmeasurement.io.mask_reader import SegmentationMask
 
+runner = CliRunner()
+
 
 def _one_pixel_labels() -> da.Array:
     return da.from_array(np.array([[1]], dtype=np.int32), chunks=(1, 1))
+
+
+def test_cli_version_flag_prints_and_exits():
+    result = runner.invoke(cli.app, ["--version"])
+    assert result.exit_code == 0
+    assert "cellmeasurement-py " in result.stdout
 
 
 def test_extract_export_geometries_uses_labels_when_boundaries_missing(monkeypatch):

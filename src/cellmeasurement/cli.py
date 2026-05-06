@@ -1,5 +1,6 @@
 import gc
 import logging
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -15,6 +16,17 @@ from .segmentation.roi_matcher import match_rois
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = typer.Typer(help="CLI for running cellmeasurement")
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    try:
+        resolved = package_version("cellmeasurement-py")
+    except PackageNotFoundError:
+        resolved = "unknown"
+    typer.echo(f"cellmeasurement-py {resolved}")
+    raise typer.Exit()
 
 
 def _extract_export_geometries(
@@ -78,6 +90,15 @@ When only one mask is provided the tool runs in single-mask mode
 """
 )
 def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show the CLI version and exit.",
+        ),
+    ] = False,
     nuclear_mask: Annotated[
         Optional[Path],
         typer.Option(help="Nuclear segmentation mask (sopa zarr directory or TIFF label image)."),
