@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev --frozen
+
+      - name: Run ruff
+        run: uv run ruff check .
+
+      - name: Fetch integration test data
+        run: |
+          mkdir -p data
+          curl -fsSL -o data/test_data.tiff https://raw.githubusercontent.com/WEHI-SODA-Hub/sp_segment/main/tests/data/mesmer/test_data.tiff
+          curl -fsSL -o data/test_data_whole-cell.tiff https://raw.githubusercontent.com/WEHI-SODA-Hub/sp_segment/main/tests/data/mesmer/test_data_whole-cell.tiff
+          curl -fsSL -o data/test_data_nuclear.tiff https://raw.githubusercontent.com/WEHI-SODA-Hub/sp_segment/main/tests/data/mesmer/test_data_nuclear.tiff
+
+      - name: Run pytest
+        run: uv run pytest -q
