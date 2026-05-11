@@ -56,6 +56,35 @@ uv sync
 uv build
 ```
 
+### Container image (GHCR, release-only)
+
+Release builds publish a container to:
+
+```bash
+ghcr.io/wehi-soda-hub/cellmeasurement-py:<release-tag>
+```
+
+When running on an HPC with Apptainer, you can use the following command to pull the container for
+it to be compatible with the [sp_segment](https://github.com/WEHI-SODA-Hub/sp_segment) Nextflow 
+pipeline:
+
+```bash
+apptainer pull --name ghcr.io-wehi-soda-hub-cellmeasurement-py-<release-tag> \
+    docker://ghcr.io/wehi-soda-hub/cellmeasurement-py:<release-tag>
+```
+
+You can run the container like so:
+
+```bash
+apptainer exec ghcr.io-wehi-soda-hub-cellmeasurement-py-<release-tag> cellmeasurement --version
+```
+
+You can also use Docker to run the container:
+
+```bash
+docker run --rm ghcr.io/wehi-soda-hub/cellmeasurement-py:<release-tag> cellmeasurement --version
+```
+
 ## Usage
 
 Entrypoint:
@@ -65,6 +94,17 @@ cellmeasurement [OPTIONS]
 ```
 
 If you are using `uv`, you can run `uv run cellmeasurement` to run the CLI.
+
+### Nextflow container usage
+
+```groovy
+process CELLMEASUREMENT {
+
+    container 'ghcr.io/wehi-soda-hub/cellmeasurement-py:<release-tag>'
+
+    ...
+}
+```
 
 ### Minimal paired run (matching + measurements + GeoJSON)
 
