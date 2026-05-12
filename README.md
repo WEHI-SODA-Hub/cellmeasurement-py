@@ -38,7 +38,9 @@ Mask inputs can be either:
 
 Intensity image input for measurements:
 
-- **Multi-channel TIFF** (`--tiff-file`)
+- **Multi-channel TIFF** (`--tiff-file`), including:
+  - MIBI-style per-page TIFFs with `channel.target` JSON metadata
+  - OPAL/QPTIFF-style multi-page TIFFs (treated as channel-stacked, with OME names when available)
 
 ## Installation
 
@@ -69,7 +71,7 @@ it to be compatible with the [sp_segment](https://github.com/WEHI-SODA-Hub/sp_se
 pipeline:
 
 ```bash
-apptainer pull --name ghcr.io-wehi-soda-hub-cellmeasurement-py-<release-tag> \
+apptainer pull --name ghcr.io-wehi-soda-hub-cellmeasurement-py-<release-tag>.img \
     docker://ghcr.io/wehi-soda-hub/cellmeasurement-py:<release-tag>
 ```
 
