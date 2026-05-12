@@ -11,7 +11,7 @@ from shapely.geometry import Polygon
 from typer.testing import CliRunner
 
 from cellmeasurement import cli
-from cellmeasurement.io.mask_reader import SegmentationMask
+from cellmeasurement.io.mask_io import SegmentationMask
 
 runner = CliRunner()
 

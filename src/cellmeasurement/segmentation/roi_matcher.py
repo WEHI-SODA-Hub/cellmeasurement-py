@@ -128,7 +128,7 @@ def match_rois(
 
     # Apply optional downsampling to both label arrays (paired mode only)
     if downsample_factor > 1.0:
-        from ..io.image_loading import maybe_downsample
+        from ..io.mask_io import maybe_downsample
         import numpy as np_for_downsample
 
         step = int(round(downsample_factor))

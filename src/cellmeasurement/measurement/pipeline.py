@@ -299,7 +299,7 @@ def _prepare_measurement_image_and_masks(
 
     effective_pixel_size = pixel_size_microns
     if downsample_factor > 1.0:
-        from ..io.image_loading import maybe_downsample
+        from ..io.mask_io import maybe_downsample
 
         step = int(round(downsample_factor))
         if step >= 2:

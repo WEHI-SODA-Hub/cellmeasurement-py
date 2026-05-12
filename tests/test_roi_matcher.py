@@ -14,7 +14,7 @@ from cellmeasurement.segmentation.roi_matcher import (
     _resolve_one_to_one,
     match_rois,
 )
-from cellmeasurement.io.mask_reader import validate_grid_compatibility
+from cellmeasurement.io.mask_io import validate_grid_compatibility
 
 
 # ---------------------------------------------------------------------------

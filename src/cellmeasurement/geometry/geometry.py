@@ -278,7 +278,7 @@ def boundaries_to_geometries(
     Args:
         boundaries: GeoDataFrame with Polygon/MultiPolygon geometry and a
             1-based integer index (as produced by
-            :func:`~cellmeasurement.io.mask_reader.load_mask`).
+            :func:`~cellmeasurement.io.mask_io.load_mask`).
         simplify: Apply Douglas-Peucker simplification.
         tolerance: Simplification tolerance in pixels.
 

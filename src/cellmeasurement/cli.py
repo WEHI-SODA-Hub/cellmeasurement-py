@@ -9,7 +9,7 @@ from shapely.geometry import Polygon
 
 from .geometry import boundaries_to_geometries, extract_label_geometries
 from .io.geojson_writer import write_geojson
-from .io.mask_reader import SegmentationMask, load_mask, validate_grid_compatibility
+from .io.mask_io import SegmentationMask, load_mask, validate_grid_compatibility
 from .measurement import measure_cells_tiled
 from .segmentation.roi_matcher import match_rois
 

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from cellmeasurement.io.image_loading import maybe_downsample
+from cellmeasurement.io.mask_io import maybe_downsample
 
 
 class TestMaybeDownsample:

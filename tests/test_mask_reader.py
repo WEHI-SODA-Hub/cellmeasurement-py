@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from cellmeasurement.io.mask_reader import load_mask
+from cellmeasurement.io.mask_io import load_mask
 
 
 def test_load_mask_tiff_converts_to_temp_zarr(tmp_path):
