@@ -97,6 +97,20 @@ def _channel_names_from_mibi_json(tf: tifffile.TiffFile) -> list[str]:
         return []
 
 
+def _is_mibi_tiff(tf: tifffile.TiffFile) -> bool:
+    """Detect MIBI-style TIFF by probing first-page JSON for ``channel.target``."""
+    if not tf.pages:
+        return False
+    first_desc = tf.pages[0].description
+    if not isinstance(first_desc, str):
+        return False
+    try:
+        parsed = json.loads(first_desc)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "channel.target" in parsed
+
+
 def _channel_names_from_imagej(tf: tifffile.TiffFile) -> list[str]:
     """Extract channel names from ImageJ Labels metadata."""
     ij = tf.imagej_metadata
@@ -131,19 +145,26 @@ def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
     ch_names: list[str] = []
     try:
         with tifffile.TiffFile(path) as tf:
-            if tf.series:
-                axes = tf.series[0].axes
-            ch_names = _extract_channel_names(tf)
+            if _is_mibi_tiff(tf):
+                arr = np.stack([page.asarray() for page in tf.pages], axis=0)
+                ch_names = _channel_names_from_mibi_json(tf)
+            elif len(tf.pages) > 1:
+                # Treat multi-page non-MIBI TIFFs (e.g. OPAL/QPTIFF) as channel-stacked.
+                arr = np.stack([page.asarray() for page in tf.pages], axis=0)
+                try:
+                    ch_names = _channel_names_from_ome(tf)
+                except Exception as exc:
+                    logger.debug("Failed OME channel extraction: %s", exc)
+                    ch_names = []
+                if not ch_names:
+                    ch_names = _channel_names_from_imagej(tf)
+            else:
+                if tf.series:
+                    axes = tf.series[0].axes
+                arr = tf.asarray()
+                ch_names = _extract_channel_names(tf)
     except Exception:
         axes = None
-
-    try:
-        arr = tifffile.memmap(path)
-    except (ValueError, OSError, tifffile.TiffFileError, NotImplementedError):
-        logger.warning(
-            "tifffile.memmap failed for %s; falling back to tifffile.imread (higher memory usage).",
-            path,
-        )
         arr = tifffile.imread(path)
 
     image_cyx = _normalize_image_cyx(np.asarray(arr), axes=axes)
