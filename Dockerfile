@@ -19,7 +19,7 @@ FROM python:3.13-slim AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends procps \
+    && apt-get install -y --no-install-recommends procps libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /dist/*.whl /tmp/
