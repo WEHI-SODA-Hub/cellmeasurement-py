@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -497,7 +498,18 @@ def measure_cells_tiled(
     if not cells:
         return {}
     _validate_measure_cells_inputs(neighbours, downsample_factor)
+    t_start = time.perf_counter()
+    logger.info(
+        "Measurement start: cells=%d, threads=%d, tile_size=%d, tile_overlap=%d, neighbours=%d, downsample_factor=%.3f",
+        len(cells),
+        threads,
+        tile_size,
+        tile_overlap,
+        neighbours,
+        downsample_factor,
+    )
 
+    t_image_load_start = time.perf_counter()
     image_cyx, ch_names, nuc_labels, wc_labels, effective_pixel_size = _prepare_measurement_image_and_masks(
         tiff_file=tiff_file,
         image_shape=image_shape,
@@ -506,8 +518,21 @@ def measure_cells_tiled(
         pixel_size_microns=pixel_size_microns,
         downsample_factor=downsample_factor,
     )
+    logger.info(
+        "Measurement image/mask preparation complete in %.2fs: image_shape=%s, channels=%d, effective_pixel_size=%.4f",
+        time.perf_counter() - t_image_load_start,
+        image_cyx.shape,
+        len(ch_names),
+        effective_pixel_size,
+    )
 
+    t_group_start = time.perf_counter()
     tile_groups = _group_cells_by_tile(cells, tile_size=tile_size)
+    logger.info(
+        "Grouped cells into %d tiles in %.2fs",
+        len(tile_groups),
+        time.perf_counter() - t_group_start,
+    )
     needs_neighbour_aggregation = neighbours > 0
     collect_results = return_results or needs_neighbour_aggregation
     results: dict[int, dict[str, float]] = {}
@@ -534,23 +559,43 @@ def measure_cells_tiled(
         pixel_size_microns=effective_pixel_size,
     )
     fallback_reads = 0
+    total_tiles = len(tile_groups)
+    progress_interval = max(1, total_tiles // 10) if total_tiles > 0 else 1
+    processed_tiles = 0
+    t_tile_loop_start = time.perf_counter()
 
     try:
         for tile_result, tile_fallback in _iter_tile_measurements(tile_groups, threads, tile_kwargs):
+            processed_tiles += 1
             if collect_results:
                 results.update(tile_result)
             if not needs_neighbour_aggregation:
                 next_stream_id = _flush_stream_rows(stream_fh, stream_pending, next_stream_id, tile_result)
             fallback_reads += tile_fallback
+            if processed_tiles == 1 or processed_tiles == total_tiles or processed_tiles % progress_interval == 0:
+                logger.info(
+                    "Measurement tile progress: %d/%d tiles (%.1f%%), elapsed=%.2fs, fallback_reads=%d",
+                    processed_tiles,
+                    total_tiles,
+                    (processed_tiles / total_tiles) * 100.0 if total_tiles else 100.0,
+                    time.perf_counter() - t_tile_loop_start,
+                    fallback_reads,
+                )
 
         if needs_neighbour_aggregation:
+            t_neighbour_start = time.perf_counter()
             _add_neighbour_measurements(
                 measurements_by_cell=results,
                 cells=cells,
                 neighbours=neighbours,
                 pixel_size_microns=effective_pixel_size,
             )
+            logger.info(
+                "Neighbour aggregation complete in %.2fs",
+                time.perf_counter() - t_neighbour_start,
+            )
     finally:
+        t_finalize_start = time.perf_counter()
         _finalize_stream(
             stream_fh,
             needs_neighbour_aggregation=needs_neighbour_aggregation,
@@ -558,7 +603,17 @@ def measure_cells_tiled(
             results=results,
             stream_pending=stream_pending,
         )
+        logger.info(
+            "Measurement stream finalization complete in %.2fs",
+            time.perf_counter() - t_finalize_start,
+        )
 
     if fallback_reads > 0:
         logger.info("Tile measurement fallback direct bbox reads: %d", fallback_reads)
+    logger.info(
+        "Measurement complete in %.2fs: measured_cells=%d, return_results=%s",
+        time.perf_counter() - t_start,
+        len(results) if collect_results else len(cells),
+        return_results,
+    )
     return results if return_results else {}

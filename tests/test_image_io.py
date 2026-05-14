@@ -64,3 +64,58 @@ def test_channel_names_from_ome_reads_channel_name():
         pages = []
 
     assert image_io._channel_names_from_ome(_FakeTF()) == ["DAPI"]
+
+
+def test_is_comet_tiff_detects_microscope_and_detector_metadata():
+    class _FakeTF:
+        ome_metadata = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Instrument ID="Instrument:0">'
+            '<Microscope Manufacturer="Lunaphore Technologies SA" Model="Comet" />'
+            '<Detector ID="Detector:0" Manufacturer="Lunaphore" Model="COMET1_SV1" Type="CMOS" />'
+            "</Instrument></OME>"
+        )
+        pages = []
+
+    assert image_io._is_comet_tiff(_FakeTF()) is True
+
+
+def test_is_comet_tiff_false_for_non_comet_ome():
+    class _FakeTF:
+        ome_metadata = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Instrument ID="Instrument:0">'
+            '<Microscope Manufacturer="Acme" Model="ScopeX" />'
+            '<Detector ID="Detector:0" Manufacturer="Acme" Model="D1" Type="CMOS" />'
+            "</Instrument></OME>"
+        )
+        pages = []
+
+    assert image_io._is_comet_tiff(_FakeTF()) is False
+
+
+def test_is_comet_tiff_detects_objective_metadata():
+    class _FakeTF:
+        ome_metadata = (
+            '<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">'
+            '<Instrument ID="Instrument:0">'
+            '<Objective ID="Objective:0" Manufacturer="Lunaphore" Model="COMET" '
+            'LensNA="0.75" WorkingDistance="1000.0" NominalMagnification="20.0" />'
+            "</Instrument></OME>"
+        )
+        pages = []
+
+    assert image_io._is_comet_tiff(_FakeTF()) is True
+
+
+def test_select_non_mibi_fullres_pages_filters_by_first_page_shape():
+    class _Page:
+        def __init__(self, shape):
+            self.shape = shape
+
+    class _FakeTF:
+        pages = [_Page((100, 200)), _Page((100, 200)), _Page((50, 100)), _Page((25, 50))]
+
+    selected = image_io._select_non_mibi_fullres_pages(_FakeTF())
+    assert len(selected) == 2
+    assert all(page.shape == (100, 200) for page in selected)

@@ -12,3 +12,4 @@ wheels/
 
 # Temporary testing files
 testing/
+data/
