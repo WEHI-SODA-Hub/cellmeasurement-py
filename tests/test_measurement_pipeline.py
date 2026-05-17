@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+import dask
 import dask.array as da
 import numpy as np
 import pytest
@@ -171,6 +172,77 @@ def test_measure_cells_tiled_streams_jsonl(tmp_path: Path):
     lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     assert '"cell_id":1' in lines[0]
+
+
+def test_measure_cells_tiled_materializes_dask_labels_once(tmp_path: Path):
+    img = np.ones((8, 8), dtype=np.uint16)
+    tiff_path = tmp_path / "img_materialize_once.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((8, 8), dtype=np.uint32)
+    wc[1:3, 1:3] = 1
+    wc[5:7, 5:7] = 2
+    nuc = np.zeros((8, 8), dtype=np.uint32)
+    nuc[1:2, 1:2] = 1
+    nuc[5:6, 5:6] = 2
+
+    calls = {"nuc": 0, "wc": 0}
+
+    def _load_nuc() -> np.ndarray:
+        calls["nuc"] += 1
+        return nuc
+
+    def _load_wc() -> np.ndarray:
+        calls["wc"] += 1
+        return wc
+
+    nuc_labels = da.from_delayed(dask.delayed(_load_nuc)(), shape=nuc.shape, dtype=nuc.dtype)
+    wc_labels = da.from_delayed(dask.delayed(_load_wc)(), shape=wc.shape, dtype=wc.dtype)
+
+    cells = [
+        CellMatch(
+            cell_id=1,
+            nucleus_label=1,
+            whole_cell_label=1,
+            bbox=(1, 1, 3, 3),
+            centroid=(1.5, 1.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+        CellMatch(
+            cell_id=2,
+            nucleus_label=2,
+            whole_cell_label=2,
+            bbox=(5, 5, 7, 7),
+            centroid=(5.5, 5.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+    ]
+
+    measured = measure_cells_tiled(
+        cells=cells,
+        nuc_labels=nuc_labels,
+        wc_labels=wc_labels,
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(8, 8),
+        tile_size=4,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+
+    assert set(measured.keys()) == {1, 2}
+    assert calls["nuc"] == 1
+    assert calls["wc"] == 1
 
 
 def test_measure_cells_tiled_uses_tiff_channel_names(tmp_path: Path):

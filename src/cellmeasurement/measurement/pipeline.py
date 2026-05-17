@@ -66,16 +66,57 @@ def _group_cells_by_tile(cells: Sequence[CellMatch], tile_size: int) -> dict[tup
 
 
 def _slice_or_compute(
-    arr: da.Array | None,
+    arr: np.ndarray | None,
     r0: int,
     r1: int,
     c0: int,
     c1: int,
 ) -> np.ndarray | None:
-    """Materialize a dask label slice as a NumPy array."""
+    """Return a sliced NumPy label window, or ``None``."""
     if arr is None:
         return None
-    return np.asarray(arr[r0:r1, c0:c1].compute())
+    return arr[r0:r1, c0:c1]
+
+
+def _materialize_label_array(
+    arr: da.Array | np.ndarray | None,
+    *,
+    name: str,
+    expected_shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Materialize one label array exactly once and validate shape."""
+    if arr is None:
+        return None
+    t0 = time.perf_counter()
+    source = "dask" if isinstance(arr, da.Array) else "numpy"
+    materialized = np.asarray(arr.compute()) if isinstance(arr, da.Array) else np.asarray(arr)
+    if materialized.ndim != 2:
+        raise ValueError(f"{name} labels must be 2D, got shape={materialized.shape}")
+    if tuple(materialized.shape) != expected_shape:
+        raise ValueError(
+            f"{name} labels shape {tuple(materialized.shape)} does not match measurement image shape {expected_shape}."
+        )
+    logger.info(
+        "Materialized %s labels once in %.2fs: source=%s, shape=%s, dtype=%s",
+        name,
+        time.perf_counter() - t0,
+        source,
+        materialized.shape,
+        materialized.dtype,
+    )
+    return materialized
+
+
+def _materialize_labels_once(
+    nuc_labels: da.Array | np.ndarray | None,
+    wc_labels: da.Array | np.ndarray | None,
+    *,
+    expected_shape: tuple[int, int],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Materialize nuclear and whole-cell labels once for tiled measurement."""
+    nuc_np = _materialize_label_array(nuc_labels, name="nuclear", expected_shape=expected_shape)
+    wc_np = _materialize_label_array(wc_labels, name="whole-cell", expected_shape=expected_shape)
+    return nuc_np, wc_np
 
 
 def _cell_masks_from_crops(
@@ -171,8 +212,8 @@ def _measure_tile(
     tile_cells: Sequence[CellMatch],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
-    nuc_labels: da.Array | None,
-    wc_labels: da.Array | None,
+    nuc_labels: np.ndarray | None,
+    wc_labels: np.ndarray | None,
     image_shape: tuple[int, int],
     tile_size: int,
     tile_overlap: int,
@@ -324,8 +365,8 @@ def _tile_measure_kwargs(
     *,
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
-    nuc_labels: da.Array | np.ndarray | None,
-    wc_labels: da.Array | np.ndarray | None,
+    nuc_labels: np.ndarray | None,
+    wc_labels: np.ndarray | None,
     image_shape: tuple[int, int],
     tile_size: int,
     tile_overlap: int,
@@ -525,6 +566,11 @@ def measure_cells_tiled(
         len(ch_names),
         effective_pixel_size,
     )
+    nuc_labels_np, wc_labels_np = _materialize_labels_once(
+        nuc_labels,
+        wc_labels,
+        expected_shape=image_shape,
+    )
 
     t_group_start = time.perf_counter()
     tile_groups = _group_cells_by_tile(cells, tile_size=tile_size)
@@ -546,8 +592,8 @@ def measure_cells_tiled(
     tile_kwargs = _tile_measure_kwargs(
         image_cyx=image_cyx,
         ch_names=ch_names,
-        nuc_labels=nuc_labels,
-        wc_labels=wc_labels,
+        nuc_labels=nuc_labels_np,
+        wc_labels=wc_labels_np,
         image_shape=image_shape,
         tile_size=tile_size,
         tile_overlap=tile_overlap,
