@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import tifffile
 
+import cellmeasurement.measurement.pipeline as measurement_pipeline
 from cellmeasurement.measurement import measure_cells_tiled
 from cellmeasurement.segmentation.cell import CellMatch
 
@@ -97,6 +98,128 @@ def test_measure_cells_tiled_basic(tmp_path: Path):
     assert props["Channel 1: Cell: Percentile: 50.0"] == 40.0
     assert any(k.startswith("Cell: ErosionBin_") for k in props)
     assert any(k.startswith("Cell: ExpansionBin_") for k in props)
+
+
+def test_measure_cells_tiled_process_workers_match_serial(tmp_path: Path):
+    img = np.zeros((10, 10), dtype=np.uint16)
+    img[1:3, 1:3] = 5
+    img[6:8, 6:8] = 11
+    tiff_path = tmp_path / "img_parallel.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((10, 10), dtype=np.uint32)
+    wc[1:3, 1:3] = 1
+    wc[6:8, 6:8] = 2
+    nuc = np.zeros((10, 10), dtype=np.uint32)
+    nuc[1:2, 1:2] = 1
+    nuc[6:7, 6:7] = 2
+
+    cells = [
+        CellMatch(
+            cell_id=1,
+            nucleus_label=1,
+            whole_cell_label=1,
+            bbox=(1, 1, 3, 3),
+            centroid=(1.5, 1.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+        CellMatch(
+            cell_id=2,
+            nucleus_label=2,
+            whole_cell_label=2,
+            bbox=(6, 6, 8, 8),
+            centroid=(6.5, 6.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+    ]
+
+    common_kwargs = dict(
+        cells=cells,
+        nuc_labels=da.from_array(nuc, chunks=(5, 5)),
+        wc_labels=da.from_array(wc, chunks=(5, 5)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(10, 10),
+        percentiles=[50.0],
+        tile_size=5,
+        tile_overlap=0,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+
+    serial = measure_cells_tiled(threads=1, **common_kwargs)
+    parallel = measure_cells_tiled(threads=2, **common_kwargs)
+    assert parallel == serial
+
+
+def test_measure_cells_tiled_process_workers_use_worker_local_tiff_reads(monkeypatch, tmp_path: Path):
+    img = np.zeros((10, 10), dtype=np.uint16)
+    img[1:3, 1:3] = 5
+    img[6:8, 6:8] = 11
+    tiff_path = tmp_path / "img_process_tiff_reads.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((10, 10), dtype=np.uint32)
+    wc[1:3, 1:3] = 1
+    wc[6:8, 6:8] = 2
+    nuc = np.zeros((10, 10), dtype=np.uint32)
+    nuc[1:2, 1:2] = 1
+    nuc[6:7, 6:7] = 2
+
+    cells = [
+        CellMatch(
+            cell_id=1,
+            nucleus_label=1,
+            whole_cell_label=1,
+            bbox=(1, 1, 3, 3),
+            centroid=(1.5, 1.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+        CellMatch(
+            cell_id=2,
+            nucleus_label=2,
+            whole_cell_label=2,
+            bbox=(6, 6, 8, 8),
+            centroid=(6.5, 6.5),
+            nucleus_area_px=1,
+            cell_area_px=4,
+            overlap_px=1,
+            overlap_fraction=1.0,
+            match_source="overlap_1to1",
+        ),
+    ]
+
+    def _fail_prepare(*args, **kwargs):
+        raise AssertionError("full image materialization path should not run in process mode")
+
+    monkeypatch.setattr(measurement_pipeline, "_prepare_measurement_image_and_masks", _fail_prepare)
+
+    measured = measure_cells_tiled(
+        cells=cells,
+        nuc_labels=da.from_array(nuc, chunks=(5, 5)),
+        wc_labels=da.from_array(wc, chunks=(5, 5)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(10, 10),
+        tile_size=5,
+        tile_overlap=0,
+        threads=2,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+    assert set(measured.keys()) == {1, 2}
 
 
 def test_measure_cells_tiled_validates_image_shape(tmp_path: Path):

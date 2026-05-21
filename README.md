@@ -177,7 +177,8 @@ uv run cellmeasurement \
 
 - Measurement is the most expensive stage.
 - `--downsample-factor` can reduce memory and runtime substantially for large images.
-- `--threads` controls tile-level measurement parallelism.
+- `--threads` controls tile-level measurement worker count (process-based execution, serial fallback at 1).
+- With `--threads > 1` and no downsampling, workers use TIFF window reads instead of materializing the full image array in RAM.
 - Use `--no-measurements` for quick geometry-only QC/export runs.
 
 ## Development
