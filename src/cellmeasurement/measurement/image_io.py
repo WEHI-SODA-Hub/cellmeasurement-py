@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+from .data_access import infer_cyx_shape
+
 logger = logging.getLogger(__name__)
 OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
 
@@ -22,7 +24,7 @@ def _normalize_image_cyx(arr: np.ndarray, axes: str | None = None) -> np.ndarray
         # Drop singleton axes not used for channel/spatial dimensions.
         for idx in range(len(axis_list) - 1, -1, -1):
             ax = axis_list[idx]
-            if ax in {"C", "S", "Q", "Y", "X"}:
+            if ax in {"C", "S", "Q", "I", "Y", "X"}:
                 continue
             if work.shape[idx] != 1:
                 raise ValueError(
@@ -31,8 +33,13 @@ def _normalize_image_cyx(arr: np.ndarray, axes: str | None = None) -> np.ndarray
             work = np.take(work, 0, axis=idx)
             axis_list.pop(idx)
 
-        channel_axis = axis_list.index("C") if "C" in axis_list else \
-            (axis_list.index("S") if "S" in axis_list else (axis_list.index("Q") if "Q" in axis_list else None))
+        channel_axis = axis_list.index("C") if "C" in axis_list else (
+            axis_list.index("S") if "S" in axis_list else (
+                axis_list.index("Q") if "Q" in axis_list else (
+                    axis_list.index("I") if "I" in axis_list else None
+                )
+            )
+        )
         if "Y" not in axis_list or "X" not in axis_list:
             raise ValueError(f"Could not find Y/X axes in TIFF layout (axes='{axes}', shape={arr.shape})")
         y_axis = axis_list.index("Y")
@@ -273,3 +280,34 @@ def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
         time.perf_counter() - t0,
     )
     return image_cyx, ch_names
+
+
+def inspect_tiff_image(path: Path) -> tuple[tuple[int, int, int], str | None, tuple[int, ...], list[str]]:
+    """Inspect TIFF metadata and return normalized image shape/channels without loading full image."""
+    with tifffile.TiffFile(path) as tf:
+        if not tf.series:
+            raise ValueError(f"TIFF file has no readable series: {path}")
+        series = tf.series[0]
+        axes = str(series.axes) if series.axes else None
+        source_shape = tuple(int(v) for v in series.shape)
+        cyx_shape = infer_cyx_shape(source_shape, axes)
+        ch_names = _extract_channel_names(tf)
+
+    n_channels = int(cyx_shape[0])
+    if not ch_names or len(ch_names) != n_channels:
+        if ch_names and len(ch_names) != n_channels:
+            logger.warning(
+                "Found %d channel names but TIFF has %d channels; using fallback names.",
+                len(ch_names),
+                n_channels,
+            )
+        ch_names = [f"Channel {i + 1}" for i in range(n_channels)]
+    logger.info(
+        "Inspected TIFF metadata (%s): source_shape=%s, axes=%s, normalized_shape=%s, channels=%d",
+        path,
+        source_shape,
+        axes,
+        cyx_shape,
+        n_channels,
+    )
+    return cyx_shape, axes, source_shape, ch_names

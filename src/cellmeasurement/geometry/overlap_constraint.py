@@ -10,6 +10,7 @@ Implements QuPath-style overlap clipping:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from shapely.geometry import Polygon, mapping, shape
@@ -145,6 +146,7 @@ def _finalize_features(features: list[dict[str, Any]], geoms: list[Any]) -> list
 
 def constrain_cell_overlaps(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Clip overlapping cell geometries so output cells do not share area."""
+    t_start = time.perf_counter()
     if not features:
         return features
 
@@ -162,7 +164,8 @@ def constrain_cell_overlaps(features: list[dict[str, Any]]) -> list[dict[str, An
     out = _finalize_features(features, geoms)
 
     log.info(
-        "Overlap constraint: checked %d pairs, clipped %d, removed %d empty cells",
+        "Overlap constraint complete in %.2fs: checked %d pairs, clipped %d, removed %d empty cells",
+        time.perf_counter() - t_start,
         len(checked),
         clipped,
         n - len(out),

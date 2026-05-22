@@ -12,7 +12,7 @@ _DISK_1 = disk(1).astype(bool)  # type: ignore[assignment]
 _DISK_1.flags.writeable = False
 
 
-def _compartment_masks(cell_mask: np.ndarray, nuc_mask: np.ndarray) -> dict[str, np.ndarray]:
+def compartment_masks(cell_mask: np.ndarray, nuc_mask: np.ndarray) -> dict[str, np.ndarray]:
     """Derive CELL/NUCLEUS/CYTOPLASM/MEMBRANE boolean masks."""
     cm = cell_mask.astype(bool)
     nm = nuc_mask.astype(bool) & cm
@@ -34,7 +34,7 @@ def _stat_values(vals: np.ndarray) -> dict[str, float]:
     }
 
 
-def _add_intensity_measurements(
+def add_intensity_measurements(
     props: dict[str, float],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
@@ -50,7 +50,7 @@ def _add_intensity_measurements(
 
     Notes
     -----
-    - ``comp_masks`` is expected to come from :func:`_compartment_masks`, so
+    - ``comp_masks`` is expected to come from :func:`compartment_masks`, so
       masks are already aligned to ``image_cyx`` spatial coordinates.
     - Empty compartments are skipped to avoid adding misleading zero-valued
       summary statistics for absent regions.
@@ -67,7 +67,7 @@ def _add_intensity_measurements(
                 props[f"{ch}: {labels[comp]}: {key}"] = value
 
 
-def _add_percentiles(
+def add_percentiles(
     props: dict[str, float],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
@@ -77,7 +77,7 @@ def _add_percentiles(
     """Populate user-requested percentiles for each channel/compartment pair.
 
     Percentiles complement the fixed summary stats from
-    :func:`_add_intensity_measurements` by exposing distribution shape (e.g.
+    :func:`add_intensity_measurements` by exposing distribution shape (e.g.
     tails and skew). Keys are emitted as:
 
     ``"<channel>: <Compartment>: Percentile: <p>"``.
@@ -97,7 +97,7 @@ def _add_percentiles(
                 props[f"{ch}: {labels[comp]}: Percentile: {p}"] = float(np.percentile(vals, p))
 
 
-def _erosion_bins_for_mask(mask: np.ndarray, n_bins: int = 5) -> list[tuple[np.ndarray, int]]:
+def erosion_bins_for_mask(mask: np.ndarray, n_bins: int = 5) -> list[tuple[np.ndarray, int]]:
     """Compute cumulative equal-area erosion boundaries for one mask."""
     total = int(np.count_nonzero(mask))
     if total == 0:
@@ -131,7 +131,7 @@ def _erosion_bins_for_mask(mask: np.ndarray, n_bins: int = 5) -> list[tuple[np.n
     return bins
 
 
-def _add_erosion_measurements(
+def add_erosion_measurements(
     props: dict[str, float],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
@@ -157,7 +157,7 @@ def _add_erosion_measurements(
             continue
 
         comp_name = comp.capitalize()
-        bin_boundaries = _erosion_bins_for_mask(base, n_bins=n_bins)
+        bin_boundaries = erosion_bins_for_mask(base, n_bins=n_bins)
         # Boundaries are cumulative masks; convert to mutually exclusive rings.
         prev_mask = base.astype(bool)
         for bin_idx, (eroded_mask, depth_px) in enumerate(bin_boundaries, start=1):
@@ -178,7 +178,7 @@ def _add_erosion_measurements(
             prev_mask = eroded_mask
 
 
-def _expansion_bins_for_mask(
+def expansion_bins_for_mask(
     cell_mask: np.ndarray,
     total_expansion_px: int,
     n_bins: int = 5,
@@ -216,7 +216,7 @@ def _expansion_bins_for_mask(
     return bins
 
 
-def _add_expansion_measurements(
+def add_expansion_measurements(
     props: dict[str, float],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
@@ -240,7 +240,7 @@ def _add_expansion_measurements(
     if base_area == 0:
         return
 
-    bin_boundaries = _expansion_bins_for_mask(cm, total_expansion_px, n_bins=n_bins)
+    bin_boundaries = expansion_bins_for_mask(cm, total_expansion_px, n_bins=n_bins)
     if not bin_boundaries:
         return
 
@@ -264,7 +264,7 @@ def _add_expansion_measurements(
         prev_mask = dilated_mask
 
 
-def _add_environment_measurements(
+def add_environment_measurements(
     props: dict[str, float],
     image_cyx: np.ndarray,
     ch_names: Sequence[str],
@@ -273,7 +273,7 @@ def _add_environment_measurements(
 ) -> None:
     """Populate single-zone 20 µm pericellular environment measurements.
 
-    Unlike :func:`_add_expansion_measurements` (which yields multiple bins),
+    Unlike :func:`add_expansion_measurements` (which yields multiple bins),
     this computes one aggregate environment compartment covering the full
     20 µm ring outside the cell boundary.
     """
