@@ -160,10 +160,16 @@ def _prepare_measurement_image_and_masks(
         step = int(round(downsample_factor))
         if step >= 2:
             nuc_np = None if nuc_labels is None else np.asarray(nuc_labels)
-            wc_np = np.asarray(wc_labels)
+            wc_missing = wc_labels is None
+            if wc_missing:
+                if nuc_np is None:
+                    raise ValueError("Downsampling requires at least one segmentation mask; got neither nucleus nor whole-cell labels.")
+                wc_np = nuc_np
+            else:
+                wc_np = np.asarray(wc_labels)
             loaded_image_cyx, nuc_ds, wc_ds = maybe_downsample(loaded_image_cyx, nuc_np, wc_np, downsample_factor)
             nuc_labels = nuc_ds
-            wc_labels = wc_ds
+            wc_labels = None if wc_missing else wc_ds
             effective_pixel_size = pixel_size_microns * step
             logger.info(
                 "Applied downsampling factor %.1f to image and masks; effective pixel size now %.2f µm",
