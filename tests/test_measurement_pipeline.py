@@ -499,6 +499,93 @@ def test_measure_cells_tiled_environment_expansion(tmp_path: Path):
     assert props["Channel 1: Cell: Environment_20um: Mean"] == 7.0
 
 
+def test_measure_cells_tiled_wc_only_skips_cytoplasm_keeps_membrane(tmp_path: Path):
+    img = np.zeros((7, 7), dtype=np.uint16)
+    img[1:6, 1:6] = 10
+    tiff_path = tmp_path / "img_wc_only_compartments.tiff"
+    _write_tiff(tiff_path, img)
+
+    wc = np.zeros((7, 7), dtype=np.uint32)
+    wc[1:6, 1:6] = 1
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(1, 1, 6, 6),
+        centroid=(3.0, 3.0),
+        nucleus_area_px=0,
+        cell_area_px=25,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+
+    measured = measure_cells_tiled(
+        cells=[cell],
+        nuc_labels=None,
+        wc_labels=da.from_array(wc, chunks=(7, 7)),
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(7, 7),
+        percentiles=[50.0],
+        tile_size=7,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+
+    props = measured[1]
+    assert not any(": Cytoplasm:" in key for key in props)
+    assert "Channel 1: Membrane: Mean" in props
+    assert "Channel 1: Membrane: Percentile: 50.0" in props
+
+
+def test_measure_cells_tiled_nuc_only_skips_membrane_and_cytoplasm(tmp_path: Path):
+    img = np.zeros((7, 7), dtype=np.uint16)
+    img[2:5, 2:5] = 11
+    tiff_path = tmp_path / "img_nuc_only_compartments.tiff"
+    _write_tiff(tiff_path, img)
+
+    nuc = np.zeros((7, 7), dtype=np.uint32)
+    nuc[2:5, 2:5] = 1
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=1,
+        whole_cell_label=None,
+        bbox=(2, 2, 5, 5),
+        centroid=(3.0, 3.0),
+        nucleus_area_px=9,
+        cell_area_px=9,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="nuc_only",
+    )
+
+    measured = measure_cells_tiled(
+        cells=[cell],
+        nuc_labels=da.from_array(nuc, chunks=(7, 7)),
+        wc_labels=None,
+        synth_geoms={},
+        tiff_file=tiff_path,
+        image_shape=(7, 7),
+        percentiles=[50.0],
+        tile_size=7,
+        tile_overlap=0,
+        threads=1,
+        erosion_enabled=False,
+        expansion_enabled=False,
+    )
+
+    props = measured[1]
+    assert "Channel 1: Cell: Mean" in props
+    assert "Channel 1: Nucleus: Mean" in props
+    assert not any(": Membrane:" in key for key in props)
+    assert not any(": Cytoplasm:" in key for key in props)
+
+
 def test_measure_cells_tiled_neighbour_aggregation(tmp_path: Path):
     img = np.ones((10, 10), dtype=np.uint16)
     tiff_path = tmp_path / "img_neighbours.tiff"

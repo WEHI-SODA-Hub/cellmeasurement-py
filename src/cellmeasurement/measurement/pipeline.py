@@ -46,7 +46,6 @@ from .tile_intensity import (
 
 logger = logging.getLogger(__name__)
 
-_ALL_COMPARTMENTS = ("CELL", "NUCLEUS", "CYTOPLASM", "MEMBRANE")
 _MEMBRANE_ONLY = ("MEMBRANE",)
 
 
@@ -258,9 +257,33 @@ def _should_skip_percentiles(mode: PerformanceMode, *, cell_mask: np.ndarray) ->
     return int(np.count_nonzero(cell_mask)) < 25
 
 
+def _has_whole_cell_boundary(cell: CellMatch) -> bool:
+    return cell.whole_cell_label is not None or cell.match_source == "watershed_synth"
+
+
+def _selected_intensity_compartments(
+    cell: CellMatch,
+    *,
+    cell_mask: np.ndarray,
+    nuc_mask: np.ndarray,
+) -> tuple[str, ...]:
+    compartments: list[str] = ["CELL"]
+    has_nucleus = cell.nucleus_label is not None and np.any(nuc_mask)
+    if has_nucleus:
+        compartments.append("NUCLEUS")
+
+    has_membrane = _has_whole_cell_boundary(cell)
+    if has_membrane and has_nucleus and np.any(cell_mask & ~nuc_mask):
+        compartments.append("CYTOPLASM")
+    if has_membrane:
+        compartments.append("MEMBRANE")
+    return tuple(compartments)
+
+
 def _measure_baseline_family(
     measurements: dict[str, float],
     *,
+    cell: CellMatch,
     cell_mask: np.ndarray,
     nuc_mask: np.ndarray,
     image_crop: np.ndarray,
@@ -272,30 +295,34 @@ def _measure_baseline_family(
 ) -> dict[str, np.ndarray]:
     measurements.update(_basic_shape_metrics(cell_mask, nuc_mask, pixel_size_microns=pixel_size_microns))
     comp_masks = compartment_masks(cell_mask, nuc_mask)
+    selected_compartments = _selected_intensity_compartments(cell, cell_mask=cell_mask, nuc_mask=nuc_mask)
+    selected_set = set(selected_compartments)
     include_median = _include_median(performance_mode)
     if image_tile is not None and indexed_comps is not None:
+        indexed_selected = {comp: idx for comp, idx in indexed_comps.items() if comp in selected_set}
         add_indexed_summary_stats(
             measurements,
             image_tile,
             ch_names,
-            indexed_comps,
+            indexed_selected,
             include_median=include_median,
         )
-        add_masked_summary_stats(
-            measurements,
-            image_crop,
-            ch_names,
-            comp_masks,
-            compartments=_MEMBRANE_ONLY,
-            include_median=include_median,
-        )
+        if "MEMBRANE" in selected_set:
+            add_masked_summary_stats(
+                measurements,
+                image_crop,
+                ch_names,
+                comp_masks,
+                compartments=_MEMBRANE_ONLY,
+                include_median=include_median,
+            )
     else:
         add_masked_summary_stats(
             measurements,
             image_crop,
             ch_names,
             comp_masks,
-            compartments=_ALL_COMPARTMENTS,
+            compartments=selected_compartments,
             include_median=include_median,
         )
     return comp_masks
@@ -304,6 +331,7 @@ def _measure_baseline_family(
 def _measure_percentile_family(
     measurements: dict[str, float],
     *,
+    cell: CellMatch,
     image_crop: np.ndarray,
     image_tile: np.ndarray | None,
     ch_names: Sequence[str],
@@ -315,16 +343,22 @@ def _measure_percentile_family(
 ) -> None:
     if not percentiles or _should_skip_percentiles(performance_mode, cell_mask=cell_mask):
         return
+    selected_compartments = _selected_intensity_compartments(
+        cell, cell_mask=cell_mask, nuc_mask=comp_masks["NUCLEUS"]
+    )
+    selected_set = set(selected_compartments)
     if image_tile is not None and indexed_comps is not None:
-        add_indexed_percentiles(measurements, image_tile, ch_names, indexed_comps, percentiles)
-        add_masked_percentiles(
-            measurements,
-            image_crop,
-            ch_names,
-            comp_masks,
-            percentiles,
-            compartments=_MEMBRANE_ONLY,
-        )
+        indexed_selected = {comp: idx for comp, idx in indexed_comps.items() if comp in selected_set}
+        add_indexed_percentiles(measurements, image_tile, ch_names, indexed_selected, percentiles)
+        if "MEMBRANE" in selected_set:
+            add_masked_percentiles(
+                measurements,
+                image_crop,
+                ch_names,
+                comp_masks,
+                percentiles,
+                compartments=_MEMBRANE_ONLY,
+            )
     else:
         add_masked_percentiles(
             measurements,
@@ -332,7 +366,7 @@ def _measure_percentile_family(
             ch_names,
             comp_masks,
             percentiles,
-            compartments=_ALL_COMPARTMENTS,
+            compartments=selected_compartments,
         )
 
 
@@ -457,6 +491,7 @@ def _measure_tile_with_context(task: TileTask, context: _WorkerContext) -> TileR
         t_baseline = time.perf_counter()
         comp_masks = _measure_baseline_family(
             measurements,
+            cell=cell,
             cell_mask=cell_mask,
             nuc_mask=nuc_mask,
             image_crop=image_crop,
@@ -471,6 +506,7 @@ def _measure_tile_with_context(task: TileTask, context: _WorkerContext) -> TileR
         t_percentiles = time.perf_counter()
         _measure_percentile_family(
             measurements,
+            cell=cell,
             image_crop=image_crop,
             image_tile=image_tile if indexed_comps is not None else None,
             ch_names=context.ch_names,
