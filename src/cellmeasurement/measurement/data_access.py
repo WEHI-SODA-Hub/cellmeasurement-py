@@ -300,22 +300,36 @@ class TiffTileDataAccess:
     _layout: _CyxLayout | None = None
 
     def __post_init__(self) -> None:
-        self._tiff = tifffile.TiffFile(Path(self.tiff_spec.path))
-        series = self._tiff.series[0]
-        self._store = series.aszarr()
-        self._array = _resolve_zarr_array(zarr.open(self._store, mode="r"))
-        source_shape = tuple(int(v) for v in self._array.shape)
-        axes = self.tiff_spec.axes
-        if axes is not None and len(axes) != len(source_shape):
-            axes = None
-        self._layout = _build_cyx_layout(shape=source_shape, axes=axes)
-        if self._layout.cyx_shape != self.tiff_spec.cyx_shape:
-            raise ValueError(
-                f"TIFF layout changed between inspection and worker open: expected {self.tiff_spec.cyx_shape}, "
-                f"got {self._layout.cyx_shape}"
-            )
+        # Delay TIFF/Zarr open until the first read; this avoids parent-process
+        # file/store opens in process mode where workers initialize their own access.
+        return
+
+    def _ensure_open(self) -> None:
+        if self._array is not None and self._layout is not None:
+            return
+        try:
+            if self._tiff is None:
+                self._tiff = tifffile.TiffFile(Path(self.tiff_spec.path))
+            if self._store is None:
+                series = self._tiff.series[0]
+                self._store = series.aszarr()
+            self._array = _resolve_zarr_array(zarr.open(self._store, mode="r"))
+            source_shape = tuple(int(v) for v in self._array.shape)
+            axes = self.tiff_spec.axes
+            if axes is not None and len(axes) != len(source_shape):
+                axes = None
+            self._layout = _build_cyx_layout(shape=source_shape, axes=axes)
+            if self._layout.cyx_shape != self.tiff_spec.cyx_shape:
+                raise ValueError(
+                    f"TIFF layout changed between inspection and worker open: expected {self.tiff_spec.cyx_shape}, "
+                    f"got {self._layout.cyx_shape}"
+                )
+        except Exception:
+            self.close()
+            raise
 
     def _read_cyx_window(self, *, r0: int, r1: int, c0: int, c1: int) -> np.ndarray:
+        self._ensure_open()
         if self._array is None or self._layout is None:
             raise RuntimeError("TIFF data access not initialized")
         index: list[Any] = []
@@ -365,6 +379,8 @@ class TiffTileDataAccess:
         return source[r0:r1, c0:c1]
 
     def close(self) -> None:
+        self._array = None
+        self._layout = None
         if self._store is not None:
             try:
                 close_fn = getattr(self._store, "close", None)
