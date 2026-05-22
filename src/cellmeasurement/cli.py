@@ -1,5 +1,6 @@
 import gc
 import logging
+import time
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Annotated, Optional
@@ -14,6 +15,7 @@ from .measurement import measure_cells_tiled
 from .segmentation.roi_matcher import match_rois
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(help="CLI for running cellmeasurement")
 
@@ -281,6 +283,7 @@ def main(
         ),
     ] = True,
 ) -> None:
+    t_cli_start = time.perf_counter()
     if nuclear_mask is None and whole_cell_mask is None:
         typer.echo(
             "Error: at least one of --nuclear-mask or --whole-cell-mask is required.", err=True
@@ -322,22 +325,37 @@ def main(
 
     try:
         if nuclear_mask is not None:
+            t_mask_load_start = time.perf_counter()
             nuc_mask = load_mask(nuclear_mask, parquet_path=parquet_path, temp_dir=temp_dir)
             typer.echo(f"Nuclear mask loaded: {nuc_mask.shape} px")
+            logger.info(
+                "Nuclear mask load complete in %.2fs: shape=%s",
+                time.perf_counter() - t_mask_load_start,
+                nuc_mask.shape,
+            )
 
         if whole_cell_mask is not None:
+            t_mask_load_start = time.perf_counter()
             wc_mask = load_mask(whole_cell_mask, parquet_path=parquet_path, temp_dir=temp_dir)
             typer.echo(f"Whole-cell mask loaded: {wc_mask.shape} px")
+            logger.info(
+                "Whole-cell mask load complete in %.2fs: shape=%s",
+                time.perf_counter() - t_mask_load_start,
+                wc_mask.shape,
+            )
 
         if nuc_mask is not None and wc_mask is not None:
+            t_grid_start = time.perf_counter()
             validate_grid_compatibility(nuc_mask, wc_mask)
             typer.echo("Grid compatibility validated.")
+            logger.info("Grid compatibility validation complete in %.2fs", time.perf_counter() - t_grid_start)
 
         nuc_arr = nuc_mask.labels if nuc_mask is not None else None
         wc_arr = wc_mask.labels if wc_mask is not None else None
         image_shape = (nuc_mask or wc_mask).shape
 
         typer.echo("Matching ROIs...")
+        t_match_start = time.perf_counter()
         cells, synth_geoms = match_rois(
             nuc_arr,
             wc_arr,
@@ -346,6 +364,12 @@ def main(
             downsample_factor=downsample_factor,
         )
         typer.echo(f"Matched {len(cells)} cells.")
+        logger.info(
+            "ROI matching complete in %.2fs: cells=%d, synth_geoms=%d",
+            time.perf_counter() - t_match_start,
+            len(cells),
+            len(synth_geoms),
+        )
 
         measurements_by_cell: dict[int, dict[str, float]] | None = None
         if measurements:
@@ -363,6 +387,7 @@ def main(
                     f"{output_file.stem}.measurements.jsonl.tmp"
                 )
                 typer.echo("Computing measurements...")
+                t_measure_start = time.perf_counter()
                 measure_cells_tiled(
                     cells=cells,
                     nuc_labels=nuc_arr,
@@ -384,12 +409,14 @@ def main(
                     return_results=False,
                 )
                 typer.echo("Computed measurements and streamed them to temporary JSONL.")
+                logger.info("Measurement phase complete in %.2fs", time.perf_counter() - t_measure_start)
 
         # Free label arrays — no longer needed after matching.
         del nuc_arr, wc_arr
         gc.collect()
 
         typer.echo("Extracting label geometries for export...")
+        t_geom_start = time.perf_counter()
         nuc_geoms = (
             _extract_export_geometries(nuc_mask, simplify=simplify_rois, tolerance=tolerance)
             if nuc_mask is not None else None
@@ -398,12 +425,19 @@ def main(
             _extract_export_geometries(wc_mask, simplify=simplify_rois, tolerance=tolerance)
             if wc_mask is not None else None
         )
+        logger.info(
+            "Geometry extraction complete in %.2fs: nuclei=%d, whole_cells=%d",
+            time.perf_counter() - t_geom_start,
+            len(nuc_geoms) if nuc_geoms is not None else 0,
+            len(wc_geoms) if wc_geoms is not None else 0,
+        )
 
         geojson_output_path = output_file
         if gzip_output and not str(geojson_output_path).endswith(".gz"):
             geojson_output_path = Path(str(geojson_output_path) + ".gz")
 
         typer.echo(f"Writing GeoJSON to {geojson_output_path}...")
+        t_export_start = time.perf_counter()
         n_written = write_geojson(
             cells=cells,
             nuc_geoms=nuc_geoms,
@@ -419,14 +453,21 @@ def main(
             output_mask=output_mask,
         )
         typer.echo(f"Exported {n_written} cell features to {geojson_output_path}.")
+        logger.info("GeoJSON export phase complete in %.2fs", time.perf_counter() - t_export_start)
         if output_mask is not None:
             typer.echo(f"Exported rasterisation mask to {output_mask}.")
     finally:
+        t_cleanup_start = time.perf_counter()
         for loaded_mask in (nuc_mask, wc_mask):
             if loaded_mask is None:
                 continue
             _cleanup_mask_temp_store(loaded_mask, keep_temp_zarr)
         _cleanup_measurements_jsonl(measurements_jsonl_path)
+        logger.info(
+            "CLI cleanup complete in %.2fs; total runtime %.2fs",
+            time.perf_counter() - t_cleanup_start,
+            time.perf_counter() - t_cli_start,
+        )
 
 
 if __name__ == "__main__":

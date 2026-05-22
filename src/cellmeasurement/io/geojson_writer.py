@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
 
 # SynthGeoms maps cell_id -> pre-simplified Polygon for watershed_synth cells.
 SynthGeoms = dict[int, Polygon]
+logger = logging.getLogger(__name__)
 
 
 def _rasterise_features_to_mask(
@@ -231,6 +234,7 @@ def write_geojson(
     Returns:
         Number of cell features written (excluding the annotation).
     """
+    t_start = time.perf_counter()
     H, W = image_shape
 
     annotation: dict = {
@@ -260,6 +264,7 @@ def write_geojson(
 
     jsonl_iter = None
     jsonl_current = None
+    t_feature_build_start = time.perf_counter()
     if measurements_jsonl_path is not None and measurements_jsonl_path.exists():
         jsonl_iter = _iter_measurements_jsonl(measurements_jsonl_path)
         jsonl_current = next(jsonl_iter, None)
@@ -285,9 +290,21 @@ def write_geojson(
         )
         if feat is not None:
             features.append(feat)
+    logger.info(
+        "GeoJSON feature build complete in %.2fs: cells=%d, features=%d",
+        time.perf_counter() - t_feature_build_start,
+        len(cells),
+        len(features),
+    )
 
     if constrain_overlaps:
+        t_overlap_start = time.perf_counter()
         features = constrain_cell_overlaps(features)
+        logger.info(
+            "GeoJSON overlap constraint phase complete in %.2fs: features=%d",
+            time.perf_counter() - t_overlap_start,
+            len(features),
+        )
 
     collection: dict = {
         "type": "FeatureCollection",
@@ -299,6 +316,7 @@ def write_geojson(
         final_output_path = Path(str(final_output_path) + ".gz")
 
     final_output_path.parent.mkdir(parents=True, exist_ok=True)
+    t_geojson_write_start = time.perf_counter()
     if gzip_output:
         with gzip.open(final_output_path, "wt", encoding="utf-8") as f:
             if pretty:
@@ -311,10 +329,24 @@ def write_geojson(
                 json.dump(collection, f, indent=2)
             else:
                 json.dump(collection, f, separators=(",", ":"))
+    logger.info(
+        "GeoJSON serialization write complete in %.2fs: path=%s, gzip=%s",
+        time.perf_counter() - t_geojson_write_start,
+        final_output_path,
+        gzip_output,
+    )
 
     if output_mask is not None:
+        t_mask_start = time.perf_counter()
         raster_mask = _rasterise_features_to_mask(features, H, W)
         output_mask.parent.mkdir(parents=True, exist_ok=True)
         tifffile.imwrite(str(output_mask), raster_mask)
+        logger.info(
+            "Raster mask export complete in %.2fs: path=%s, shape=%s",
+            time.perf_counter() - t_mask_start,
+            output_mask,
+            raster_mask.shape,
+        )
 
+    logger.info("GeoJSON export total complete in %.2fs", time.perf_counter() - t_start)
     return len(features)
