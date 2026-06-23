@@ -55,18 +55,18 @@ def _rasterise_features_to_mask(
 
     Uses post-constraint feature geometries so raster output matches the final
     exported non-overlapping polygons.
-    """
-    max_id = max(
-        (
-            int(feat.get("properties", {}).get("id", 0))
-            for feat in features
-            if feat.get("properties", {}).get("objectType") == "cell"
-        ),
-        default=0,
-    )
-    dtype = np.int32 if max_id < (2**31) else np.int64
-    mask = np.zeros((height, width), dtype=dtype)
 
+    Cells are painted largest-area first, so a smaller cell is always drawn
+    *after* any larger cell it touches and therefore wins the contested pixels.
+    Interior rings (holes) are excluded from a cell's own footprint rather than
+    zeroed globally, so a cell never erases another cell that legitimately
+    occupies its hole.  Without this, a small cell nested in a larger cell's
+    concavity (e.g. a donut produced by overlap-constraint clipping) was
+    engulfed by the larger cell and disappeared from the mask while remaining in
+    the GeoJSON.
+    """
+    cell_geoms: list[tuple[float, int, Polygon]] = []
+    max_id = 0
     for feat in features:
         props = feat.get("properties", {})
         if props.get("objectType") != "cell":
@@ -74,11 +74,22 @@ def _rasterise_features_to_mask(
         cell_id = int(props.get("id", 0))
         if cell_id <= 0:
             continue
-
         geom = shape(feat["geometry"])
         if geom.is_empty:
             continue
+        max_id = max(max_id, cell_id)
+        cell_geoms.append((geom.area, cell_id, geom))
 
+    dtype = np.int32 if max_id < (2**31) else np.int64
+    mask = np.zeros((height, width), dtype=dtype)
+
+    # Largest cells first; smaller cells painted last win any contested pixels,
+    # mirroring the "trim the larger by the smaller" rule of
+    # ``constrain_cell_overlaps`` and preventing a large cell from engulfing a
+    # smaller neighbour even if overlap clipping is disabled upstream.
+    cell_geoms.sort(key=lambda item: item[0], reverse=True)
+
+    for _area, cell_id, geom in cell_geoms:
         polygons: list[Polygon]
         if geom.geom_type == "Polygon":
             polygons = [geom]  # type: ignore[list-item]
@@ -91,14 +102,29 @@ def _rasterise_features_to_mask(
             exterior = np.asarray(poly.exterior.coords)
             if exterior.shape[0] < 3:
                 continue
-            rr, cc = draw_polygon(exterior[:, 1], exterior[:, 0], shape=(height, width))
-            mask[rr, cc] = cell_id
+
+            # Rasterise within the polygon's bounding box to bound memory and
+            # let holes be carved from the cell's footprint locally.
+            minx, miny, maxx, maxy = poly.bounds
+            r0 = max(int(np.floor(miny)), 0)
+            c0 = max(int(np.floor(minx)), 0)
+            r1 = min(int(np.ceil(maxy)) + 1, height)
+            c1 = min(int(np.ceil(maxx)) + 1, width)
+            if r1 <= r0 or c1 <= c0:
+                continue
+
+            local = np.zeros((r1 - r0, c1 - c0), dtype=bool)
+            rr, cc = draw_polygon(exterior[:, 1] - r0, exterior[:, 0] - c0, shape=local.shape)
+            local[rr, cc] = True
             for hole in poly.interiors:
                 interior = np.asarray(hole.coords)
                 if interior.shape[0] < 3:
                     continue
-                rr_h, cc_h = draw_polygon(interior[:, 1], interior[:, 0], shape=(height, width))
-                mask[rr_h, cc_h] = 0
+                rr_h, cc_h = draw_polygon(interior[:, 1] - r0, interior[:, 0] - c0, shape=local.shape)
+                local[rr_h, cc_h] = False
+
+            rr_f, cc_f = np.nonzero(local)
+            mask[rr_f + r0, cc_f + c0] = cell_id
 
     return mask
 
