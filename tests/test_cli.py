@@ -32,11 +32,13 @@ def test_extract_export_geometries_uses_labels_when_boundaries_missing(monkeypat
 
     called = {"extract": False}
 
-    def fake_extract_label_geometries(labels, simplify, tolerance):
+    def fake_extract_label_geometries(labels, **kwargs):
         called["extract"] = True
         assert labels.shape == (1, 1)
-        assert simplify is True
-        assert tolerance == 0.5
+        assert kwargs["simplify"] is True
+        assert kwargs["tolerance"] == 0.5
+        assert kwargs["workers"] == 4
+        assert kwargs["resume"] is True
         return {1: expected}
 
     def fail_boundaries(*args, **kwargs):
@@ -45,9 +47,44 @@ def test_extract_export_geometries_uses_labels_when_boundaries_missing(monkeypat
     monkeypatch.setattr(cli, "extract_label_geometries", fake_extract_label_geometries)
     monkeypatch.setattr(cli, "boundaries_to_geometries", fail_boundaries)
 
-    geoms = cli._extract_export_geometries(mask, simplify=True, tolerance=0.5)
+    geoms = cli._extract_export_geometries(
+        mask, simplify=True, tolerance=0.5, role="whole_cell", workers=4
+    )
     assert called["extract"] is True
     assert geoms == {1: expected}
+
+
+def test_extract_export_geometries_namespaces_checkpoint_by_role(monkeypatch, tmp_path):
+    """Nuclear and whole-cell masks must never share a checkpoint directory."""
+    mask = SegmentationMask(labels=_one_pixel_labels(), shape=(1, 1), boundaries=None)
+    seen: list[Path] = []
+
+    def capture(labels, **kwargs):
+        seen.append(kwargs["checkpoint_dir"])
+        return {}
+
+    monkeypatch.setattr(cli, "extract_label_geometries", capture)
+
+    for role in ("nucleus", "whole_cell"):
+        cli._extract_export_geometries(
+            mask, simplify=True, tolerance=0.5, role=role, checkpoint_dir=tmp_path
+        )
+
+    assert seen == [tmp_path / "nucleus", tmp_path / "whole_cell"]
+
+
+def test_extract_export_geometries_without_checkpoint_dir_passes_none(monkeypatch):
+    mask = SegmentationMask(labels=_one_pixel_labels(), shape=(1, 1), boundaries=None)
+    seen: dict = {}
+
+    def capture(labels, **kwargs):
+        seen.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(cli, "extract_label_geometries", capture)
+    cli._extract_export_geometries(mask, simplify=True, tolerance=0.5, role="whole_cell")
+
+    assert seen["checkpoint_dir"] is None
 
 
 def test_extract_export_geometries_uses_boundaries_when_available(monkeypatch):
@@ -71,7 +108,9 @@ def test_extract_export_geometries_uses_boundaries_when_available(monkeypatch):
     monkeypatch.setattr(cli, "boundaries_to_geometries", fake_boundaries_to_geometries)
     monkeypatch.setattr(cli, "extract_label_geometries", fail_extract)
 
-    geoms = cli._extract_export_geometries(mask, simplify=False, tolerance=1.25)
+    geoms = cli._extract_export_geometries(
+        mask, simplify=False, tolerance=1.25, role="whole_cell", checkpoint_dir=Path("unused")
+    )
     assert called["boundaries"] is True
     assert geoms == {1: expected}
 
@@ -99,7 +138,7 @@ def test_main_cleans_temp_store_by_default(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", fake_load_mask)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
     cli.main(
@@ -130,7 +169,7 @@ def test_main_keeps_temp_store_when_flag_enabled(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
     cli.main(
@@ -181,7 +220,7 @@ def test_main_mixed_zarr_tiff_validates_and_cleans_only_temp(monkeypatch, tmp_pa
     monkeypatch.setattr(cli, "load_mask", fake_load_mask)
     monkeypatch.setattr(cli, "validate_grid_compatibility", fake_validate)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
     cli.main(
@@ -215,7 +254,7 @@ def test_main_preserves_primary_error_when_cleanup_fails(monkeypatch, tmp_path, 
         "match_rois",
         lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: (_ for _ in ()).throw(RuntimeError("pipeline failed")),
     )
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
     monkeypatch.setattr(cli, "write_geojson", lambda **kwargs: 0)
 
     with pytest.raises(RuntimeError, match="pipeline failed"):
@@ -244,7 +283,7 @@ def test_main_measurements_on_by_default(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
 
     def fake_measure(**kwargs):
         called["measure"] = True
@@ -281,7 +320,7 @@ def test_main_warns_when_measurements_requested_without_tiff(monkeypatch, tmp_pa
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
 
     def fake_measure(**kwargs):
         called["measure"] = True
@@ -329,7 +368,7 @@ def test_main_runs_measurements_when_enabled_with_tiff(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([cell], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
 
     def fake_measure(**kwargs):
         called["measure"] = True
@@ -392,7 +431,7 @@ def test_main_passes_step_toggles_to_measurements(monkeypatch, tmp_path):
         return [cell], {}
 
     monkeypatch.setattr(cli, "match_rois", fake_match_rois)
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
 
     def fake_measure(**kwargs):
         called["erosion_enabled"] = kwargs["erosion_enabled"]
@@ -463,7 +502,7 @@ def test_main_passes_gzip_and_rasterisation_flags(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_mask", lambda mask_path, parquet_path, temp_dir: dummy)
     monkeypatch.setattr(cli, "match_rois", lambda nuc, wc, dist_threshold, estimate_cell_boundary_dist, downsample_factor: ([], {}))
-    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance: {})
+    monkeypatch.setattr(cli, "_extract_export_geometries", lambda mask, simplify, tolerance, **kwargs: {})
 
     def fake_write_geojson(**kwargs):
         writer_args.update(kwargs)

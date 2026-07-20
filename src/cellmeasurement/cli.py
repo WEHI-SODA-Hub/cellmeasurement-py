@@ -9,6 +9,7 @@ import typer
 from shapely.geometry import Polygon
 
 from .geometry import boundaries_to_geometries, extract_label_geometries
+from .geometry.geometry import DEFAULT_GEOMETRY_BATCH_SIZE
 from .io.geojson_writer import write_geojson
 from .io.mask_io import SegmentationMask, load_mask, validate_grid_compatibility
 from .measurement import measure_cells_tiled
@@ -35,11 +36,38 @@ def _extract_export_geometries(
     mask: SegmentationMask,
     simplify: bool,
     tolerance: float,
+    *,
+    role: str,
+    workers: int = 1,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+    batch_size: int = DEFAULT_GEOMETRY_BATCH_SIZE,
 ) -> dict[int, Polygon]:
-    """Build export geometries from boundaries when available, otherwise from labels."""
+    """Build export geometries from boundaries when available, otherwise from labels.
+
+    Args:
+        mask: Loaded segmentation mask.
+        simplify: Apply Douglas-Peucker simplification.
+        tolerance: Simplification tolerance in pixels.
+        role: ``"nucleus"`` or ``"whole_cell"``; namespaces the checkpoint
+            subdirectory so the two masks never share shards.
+        workers: Worker processes for label polygonization.
+        checkpoint_dir: Parent directory for resumable shards, or ``None``.
+        resume: Reuse shards already present.
+        batch_size: Labels per batch and checkpoint granularity.
+    """
     if mask.boundaries is not None:
+        # Boundaries are already vectors; there is nothing slow to checkpoint.
         return boundaries_to_geometries(mask.boundaries, simplify=simplify, tolerance=tolerance)
-    return extract_label_geometries(mask.labels, simplify=simplify, tolerance=tolerance)
+    return extract_label_geometries(
+        mask.labels,
+        simplify=simplify,
+        tolerance=tolerance,
+        workers=workers,
+        checkpoint_dir=(checkpoint_dir / role) if checkpoint_dir is not None else None,
+        resume=resume,
+        batch_size=batch_size,
+    )
 
 
 def _cleanup_mask_temp_store(mask: SegmentationMask, keep_temp_zarr: bool) -> None:
@@ -255,6 +283,34 @@ def main(
         float,
         typer.Option(help="Simplification tolerance in pixels (lower = more detail)."),
     ] = 0.5,
+    geometry_checkpoint_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            help=(
+                "Directory for resumable geometry-extraction checkpoints. Completed "
+                "batches are written as shards, so a run killed by wall-time or OOM "
+                "resumes from the last completed batch. Point this at a stable path "
+                "outside the job's scratch/work directory, otherwise a retry starts "
+                "from scratch."
+            ),
+        ),
+    ] = None,
+    resume_geometry: Annotated[
+        bool,
+        typer.Option(
+            "--resume-geometry/--no-resume-geometry",
+            help=(
+                "Reuse existing shards in --geometry-checkpoint-dir. Disable to force "
+                "a full re-extraction."
+            ),
+        ),
+    ] = True,
+    geometry_batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Labels per geometry batch; also the checkpoint granularity.",
+        ),
+    ] = DEFAULT_GEOMETRY_BATCH_SIZE,
     pretty_json: Annotated[
         bool,
         typer.Option("--pretty-json/--no-pretty-json", help="Write indented JSON output."),
@@ -417,12 +473,20 @@ def main(
 
         typer.echo("Extracting label geometries for export...")
         t_geom_start = time.perf_counter()
+        geometry_kwargs = {
+            "simplify": simplify_rois,
+            "tolerance": tolerance,
+            "workers": threads,
+            "checkpoint_dir": geometry_checkpoint_dir,
+            "resume": resume_geometry,
+            "batch_size": geometry_batch_size,
+        }
         nuc_geoms = (
-            _extract_export_geometries(nuc_mask, simplify=simplify_rois, tolerance=tolerance)
+            _extract_export_geometries(nuc_mask, role="nucleus", **geometry_kwargs)
             if nuc_mask is not None else None
         )
         wc_geoms = (
-            _extract_export_geometries(wc_mask, simplify=simplify_rois, tolerance=tolerance)
+            _extract_export_geometries(wc_mask, role="whole_cell", **geometry_kwargs)
             if wc_mask is not None else None
         )
         logger.info(

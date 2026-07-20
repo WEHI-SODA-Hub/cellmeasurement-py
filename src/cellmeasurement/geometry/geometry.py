@@ -4,10 +4,18 @@ Pre-extracts simplified polygon geometries from raster label masks so that
 downstream steps (measurement, GeoJSON export) work with vectors rather than
 re-querying the zarr store per cell.
 
+Extraction mirrors the measurement pipeline's execution model: the label array
+is materialised once, every bounding box comes from a single
+:func:`scipy.ndimage.find_objects` pass, and labels are polygonized in batches
+across a process pool with the labels held in shared memory. The previous
+design issued one dask task per label, which on a million-cell mask built a
+task graph with millions of nodes and then executed it on a single core because
+the Shapely work is GIL-bound.
+
 Typical pipeline position
 --------------------------
 1. Load masks (``SegmentationMask``)
-2. **extract_label_geometries** — chunk-parallel scan → simplified polygons
+2. **extract_label_geometries** — batched, process-parallel, resumable
 3. ``match_rois`` — raster-based matching (unchanged)
 4. Convert synthesised masks → polygons (where needed)
 5. Measure / export using pre-simplified geometry dicts
@@ -16,18 +24,24 @@ Typical pipeline position
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-import geopandas as gpd
 import numpy as np
-from dask.delayed import delayed
-from dask.base import compute
+import scipy.ndimage as ndi
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from skimage.measure import find_contours
 
+from ..shared_array import SharedArraySpec, create_shared_array, open_shared_array
+from .geometry_store import GeometryShardStore, arrays_to_polygons, polygons_to_arrays
+
 if TYPE_CHECKING:
     import dask.array as da
+    import geopandas as gpd
 
 __all__ = [
     "extract_label_geometries",
@@ -36,6 +50,8 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_GEOMETRY_BATCH_SIZE = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -130,83 +146,87 @@ def mask_to_geometry(
 # ---------------------------------------------------------------------------
 
 
-def _bboxes_chunk(arr: np.ndarray, row_off: int, col_off: int) -> dict[int, tuple[int, int, int, int]]:
-    """Return ``{label_id: (row_min, col_min, row_max, col_max)}`` for one chunk."""
-    result: dict[int, tuple[int, int, int, int]] = {}
-    rr, cc = np.nonzero(arr)
-    if rr.size == 0:
-        return result
+def _materialize_labels(label_arr: da.Array | np.ndarray) -> np.ndarray:
+    """Bring a label array fully into memory exactly once.
 
-    labels = arr[rr, cc]
-    glo_rr = rr.astype(np.int64) + row_off
-    glo_cc = cc.astype(np.int64) + col_off
-
-    unique_labels, inverse = np.unique(labels, return_inverse=True)
-    n = len(unique_labels)
-
-    row_min = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
-    row_max = np.full(n, np.iinfo(np.int64).min, dtype=np.int64)
-    col_min = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
-    col_max = np.full(n, np.iinfo(np.int64).min, dtype=np.int64)
-
-    np.minimum.at(row_min, inverse, glo_rr)
-    np.maximum.at(row_max, inverse, glo_rr)
-    np.minimum.at(col_min, inverse, glo_cc)
-    np.maximum.at(col_max, inverse, glo_cc)
-
-    for i, lab in enumerate(unique_labels):
-        result[int(lab)] = (int(row_min[i]), int(col_min[i]), int(row_max[i]), int(col_max[i]))
-    return result
+    The previous implementation left the array lazy and issued one dask slice
+    per label, so a million-cell mask produced a task graph with millions of
+    nodes.  A single materialisation is dramatically cheaper: a 21006x39138
+    ``uint32`` mask is only ~3.3 GB, and the measurement pipeline already
+    materialises the same array for the same reason.
+    """
+    if isinstance(label_arr, np.ndarray):
+        return label_arr
+    compute_fn = getattr(label_arr, "compute", None)
+    if callable(compute_fn):
+        return cast(np.ndarray, compute_fn())
+    return np.asarray(label_arr)
 
 
-def _merge_bboxes(
-    parts: list[dict[int, tuple[int, int, int, int]]],
-) -> dict[int, tuple[int, int, int, int]]:
-    merged: dict[int, tuple[int, int, int, int]] = {}
-    for part in parts:
-        for label_id, (r0, c0, r1, c1) in part.items():
-            if label_id not in merged:
-                merged[label_id] = (r0, c0, r1, c1)
-            else:
-                mr0, mc0, mr1, mc1 = merged[label_id]
-                merged[label_id] = (
-                    min(mr0, r0), min(mc0, c0),
-                    max(mr1, r1), max(mc1, c1),
-                )
-    return merged
+def _label_bboxes(labels: np.ndarray) -> dict[int, tuple[int, int, int, int]]:
+    """Per-label bounding boxes via a single C-level pass.
 
+    Returns ``{label_id: (r0, c0, r1, c1)}`` with **exclusive** row/col stops,
+    so ``labels[r0:r1, c0:c1]`` is the label's bounding-box crop.
 
-def _collect_label_bboxes(label_arr: da.Array) -> dict[int, tuple[int, int, int, int]]:
-    """Chunk-parallel per-label bounding boxes (row_min, col_min, row_max, col_max)."""
-    n_row = len(label_arr.chunks[0])
-    n_col = len(label_arr.chunks[1])
-    row_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[0])[:-1]]
-    col_offs = [0] + [int(x) for x in np.cumsum(label_arr.chunks[1])[:-1]]
-    delayed_arr = label_arr.to_delayed()
-    delayed_results = [
-        delayed(_bboxes_chunk)(delayed_arr[i, j], row_offs[i], col_offs[j])
-        for i in range(n_row)
-        for j in range(n_col)
-    ]
-    return _merge_bboxes(list(compute(*delayed_results)))
+    ``find_objects`` allocates one list slot per value in ``1..labels.max()``,
+    which suits the dense ``1..N`` labelling every supported segmenter emits.
+    A mask whose IDs were sparse across a very wide range would make that list
+    disproportionately large.
+    """
+    slices = ndi.find_objects(labels)
+    boxes: dict[int, tuple[int, int, int, int]] = {}
+    for index, slc in enumerate(slices):
+        if slc is None:
+            continue
+        row_slice, col_slice = slc
+        boxes[index + 1] = (
+            int(row_slice.start),
+            int(col_slice.start),
+            int(row_slice.stop),
+            int(col_slice.stop),
+        )
+    return boxes
 
 
 # ---------------------------------------------------------------------------
-# Delayed per-label polygonization
+# Process-parallel batch polygonization
 # ---------------------------------------------------------------------------
 
+# Per-worker state, populated by the pool initializer.
+_WORKER_LABELS: np.ndarray | None = None
+_WORKER_SHM: SharedMemory | None = None
 
-@delayed
-def _polygonize_delayed(
-    crop: np.ndarray,
-    label_id: int,
-    simplify: bool,
-    tolerance: float,
-    row_off: int,
-    col_off: int,
-) -> Polygon | None:
-    """Materialise a crop array and extract the polygon for one label."""
-    return mask_to_geometry(crop == label_id, simplify, tolerance, row_off, col_off)
+
+def _init_geometry_worker(spec: SharedArraySpec) -> None:
+    """Attach the worker to the parent's shared label array."""
+    global _WORKER_LABELS, _WORKER_SHM
+    _WORKER_LABELS, _WORKER_SHM = open_shared_array(spec)
+
+
+def _polygonize_batch(
+    batch: tuple[int, tuple[tuple[int, int, int, int, int], ...], bool, float],
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Polygonize one batch of labels and return flat ragged arrays.
+
+    Returning arrays rather than Shapely objects keeps the inter-process
+    payload small; the parent never rebuilds a polygon it is only going to
+    write straight to disk.
+    """
+    batch_index, entries, simplify, tolerance = batch
+    labels = _WORKER_LABELS
+    if labels is None:
+        raise RuntimeError("Geometry worker was not initialised with a label array")
+
+    items: list[tuple[int, Polygon]] = []
+    for label_id, r0, c0, r1, c1 in entries:
+        crop = labels[r0:r1, c0:c1]
+        poly = mask_to_geometry(crop == label_id, simplify, tolerance, r0, c0)
+        if poly is not None:
+            items.append((label_id, poly))
+
+    ids, ring_counts, poly_ring_counts, coords = polygons_to_arrays(items)
+    return batch_index, ids, ring_counts, poly_ring_counts, coords
 
 
 # ---------------------------------------------------------------------------
@@ -214,53 +234,177 @@ def _polygonize_delayed(
 # ---------------------------------------------------------------------------
 
 
+def _build_batches(
+    bboxes: dict[int, tuple[int, int, int, int]],
+    batch_size: int,
+) -> list[tuple[int, tuple[tuple[int, int, int, int, int], ...]]]:
+    """Split labels into deterministically numbered batches.
+
+    Batch numbering must be stable across runs for checkpoint resume to be able
+    to skip completed work, so labels are always sorted and chunked identically.
+    """
+    label_ids = sorted(bboxes)
+    batches: list[tuple[int, tuple[tuple[int, int, int, int, int], ...]]] = []
+    for batch_index, start in enumerate(range(0, len(label_ids), batch_size)):
+        entries = tuple(
+            (label_id, *bboxes[label_id]) for label_id in label_ids[start : start + batch_size]
+        )
+        batches.append((batch_index, entries))
+    return batches
+
+
 def extract_label_geometries(
-    label_arr: da.Array,
+    label_arr: da.Array | np.ndarray,
     simplify: bool = True,
     tolerance: float = 0.5,
+    workers: int = 1,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+    batch_size: int = DEFAULT_GEOMETRY_BATCH_SIZE,
 ) -> dict[int, Polygon]:
     """Extract and optionally simplify polygon geometries for all labels.
 
-    Performs a single chunk-parallel scan to collect per-label bounding boxes,
-    then submits one delayed task per label that materialises only its bbox crop
-    and extracts the polygon. Dask computes these concurrently so individual
-    crop arrays are never all resident in memory at the same time.
+    Materialises the label array once, derives every bounding box in a single
+    :func:`scipy.ndimage.find_objects` pass, then polygonizes labels in batches
+    across a process pool with the labels held in shared memory.
+
+    When ``checkpoint_dir`` is set, each completed batch is persisted as a shard
+    before the next is collected, so a job killed by wall-time or OOM can resume
+    from the last completed batch instead of restarting.
 
     Args:
-        label_arr: 2-D dask integer label array.
+        label_arr: 2-D integer label array (dask or NumPy).
         simplify: Apply Douglas-Peucker simplification.
         tolerance: Simplification tolerance in pixels.
+        workers: Worker processes. ``<= 1`` runs serially in-process.
+        checkpoint_dir: Directory for resumable geometry shards. ``None``
+            disables checkpointing.
+        resume: Reuse shards already present in ``checkpoint_dir``.
+        batch_size: Labels per batch. Also the checkpoint granularity.
 
     Returns:
         Mapping of label ID to Shapely Polygon in global image coordinates.
         Labels that produce no valid contour are omitted.
     """
-    bboxes = _collect_label_bboxes(label_arr)
+    t_start = time.perf_counter()
+    labels = _materialize_labels(label_arr)
+    logger.info(
+        "Materialized labels for geometry extraction in %.2fs: shape=%s, dtype=%s",
+        time.perf_counter() - t_start,
+        labels.shape,
+        labels.dtype,
+    )
+
+    t_bbox = time.perf_counter()
+    bboxes = _label_bboxes(labels)
     if not bboxes:
         return {}
+    logger.info(
+        "Collected %d label bounding boxes in %.2fs", len(bboxes), time.perf_counter() - t_bbox
+    )
 
-    H, W = int(label_arr.shape[0]), int(label_arr.shape[1])
-    label_ids = sorted(bboxes.keys())
+    batches = _build_batches(bboxes, batch_size)
+    store = GeometryShardStore(checkpoint_dir) if checkpoint_dir is not None else None
 
-    delayed_geoms = []
-    for label_id in label_ids:
-        r0, c0, r1, c1 = bboxes[label_id]
-        # 1-px padding so contours never coincide with the crop boundary.
-        pr0, pc0 = max(0, r0 - 1), max(0, c0 - 1)
-        pr1, pc1 = min(H, r1 + 2), min(W, c1 + 2)
-        crop = label_arr[pr0:pr1, pc0:pc1]
-        delayed_geoms.append(
-            _polygonize_delayed(crop, label_id, simplify, tolerance, pr0, pc0)
+    reusable = False
+    if store is not None:
+        if not resume:
+            store.clear()
+        # Guard against a checkpoint left behind by a run with different inputs
+        # or settings, whose shards would otherwise be silently adopted.
+        reusable = store.reconcile_fingerprint(
+            {
+                "simplify": bool(simplify),
+                "tolerance": float(tolerance),
+                "batch_size": int(batch_size),
+                "n_labels": len(bboxes),
+                "image_shape": [int(labels.shape[0]), int(labels.shape[1])],
+            }
         )
 
-    computed: tuple[Polygon | None, ...] = compute(*delayed_geoms)
+    done: set[int] = set()
+    if store is not None and resume and reusable:
+        done = store.completed_batches()
+        if done:
+            logger.info(
+                "Resuming geometry extraction: %d/%d batches already checkpointed in %s",
+                len(done),
+                len(batches),
+                store.directory,
+            )
+    pending = [batch for batch in batches if batch[0] not in done]
+
+    logger.info(
+        "Geometry extraction start: labels=%d, batches=%d (pending=%d), "
+        "batch_size=%d, workers=%d, checkpoint=%s",
+        len(bboxes),
+        len(batches),
+        len(pending),
+        batch_size,
+        workers,
+        store.directory if store is not None else "disabled",
+    )
 
     geoms: dict[int, Polygon] = {}
-    for label_id, poly in zip(label_ids, computed):
-        if poly is not None:
-            geoms[label_id] = poly
+    t_poly = time.perf_counter()
+    completed = 0
 
-    logger.info("Extracted %d/%d label geometries", len(geoms), len(label_ids))
+    def _handle(result: tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]) -> None:
+        nonlocal completed
+        batch_index, ids, ring_counts, poly_ring_counts, coords = result
+        if store is not None:
+            store.write_shard(batch_index, ids, ring_counts, poly_ring_counts, coords)
+        else:
+            geoms.update(arrays_to_polygons(ids, ring_counts, poly_ring_counts, coords))
+        completed += 1
+        if completed % 25 == 0 or completed == len(pending):
+            logger.info(
+                "Geometry extraction progress: %d/%d batches (%.1f%%), elapsed=%.2fs",
+                completed,
+                len(pending),
+                100.0 * completed / max(1, len(pending)),
+                time.perf_counter() - t_poly,
+            )
+
+    if pending:
+        payloads = [
+            (batch_index, entries, simplify, tolerance) for batch_index, entries in pending
+        ]
+        if workers <= 1 or len(payloads) == 1:
+            global _WORKER_LABELS
+            _WORKER_LABELS = labels
+            try:
+                for payload in payloads:
+                    _handle(_polygonize_batch(payload))
+            finally:
+                _WORKER_LABELS = None
+        else:
+            spec, shm = create_shared_array(labels)
+            # Workers read the shared copy; drop the parent's private one so
+            # peak RSS stays at one label array rather than two.
+            del labels
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_geometry_worker,
+                    initargs=(spec,),
+                ) as executor:
+                    futures = [executor.submit(_polygonize_batch, p) for p in payloads]
+                    for future in as_completed(futures):
+                        _handle(future.result())
+            finally:
+                shm.close()
+                shm.unlink()
+
+    if store is not None:
+        geoms = store.load()
+
+    logger.info(
+        "Extracted %d/%d label geometries in %.2fs",
+        len(geoms),
+        len(bboxes),
+        time.perf_counter() - t_start,
+    )
     return geoms
 
 
