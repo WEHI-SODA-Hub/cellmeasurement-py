@@ -7,10 +7,7 @@ re-querying the zarr store per cell.
 Extraction mirrors the measurement pipeline's execution model: the label array
 is materialised once, every bounding box comes from a single
 :func:`scipy.ndimage.find_objects` pass, and labels are polygonized in batches
-across a process pool with the labels held in shared memory. The previous
-design issued one dask task per label, which on a million-cell mask built a
-task graph with millions of nodes and then executed it on a single core because
-the Shapely work is GIL-bound.
+across a process pool with the labels held in shared memory.
 
 Typical pipeline position
 --------------------------
@@ -149,11 +146,9 @@ def mask_to_geometry(
 def _materialize_labels(label_arr: da.Array | np.ndarray) -> np.ndarray:
     """Bring a label array fully into memory exactly once.
 
-    The previous implementation left the array lazy and issued one dask slice
-    per label, so a million-cell mask produced a task graph with millions of
-    nodes.  A single materialisation is dramatically cheaper: a 21006x39138
-    ``uint32`` mask is only ~3.3 GB, and the measurement pipeline already
-    materialises the same array for the same reason.
+    A single materialisation is cheap: a 21006x39138 ``uint32`` mask is only
+    ~3.3 GB, and the measurement pipeline already materialises the same array
+    for the same reason.
     """
     if isinstance(label_arr, np.ndarray):
         return label_arr
