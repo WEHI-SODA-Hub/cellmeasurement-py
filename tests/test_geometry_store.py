@@ -9,6 +9,7 @@ from shapely.geometry import Polygon
 from cellmeasurement.geometry.geometry import (
     _build_batches,
     _label_bboxes,
+    _labels_digest,
     extract_label_geometries,
     mask_to_geometry,
 )
@@ -243,8 +244,33 @@ def test_matching_settings_keep_checkpoint(tmp_path):
             "batch_size": 3,
             "n_labels": 9,
             "image_shape": [36, 36],
+            "labels_digest": _labels_digest(labels),
         }
     ) is True
+
+
+def test_same_shape_settings_different_mask_discards_checkpoint(tmp_path, caplog):
+    """Identical resolution/settings/cell count but a different mask must not reuse shards."""
+    labels_a = _labels_grid(3, 3)
+    # Flip preserves shape and the set of label ids (so image_shape and n_labels
+    # match) while relocating every cell, so only the content digest differs.
+    labels_b = np.ascontiguousarray(np.fliplr(labels_a))
+    assert labels_a.shape == labels_b.shape
+    assert set(np.unique(labels_a)) == set(np.unique(labels_b))
+    assert _labels_digest(labels_a) != _labels_digest(labels_b)
+
+    checkpoint = tmp_path / "ckpt"
+    extract_label_geometries(labels_a, tolerance=0.5, batch_size=3, checkpoint_dir=checkpoint)
+
+    with caplog.at_level("WARNING"):
+        result = extract_label_geometries(
+            labels_b, tolerance=0.5, batch_size=3, checkpoint_dir=checkpoint
+        )
+
+    assert "different settings" in caplog.text
+    expected = _reference_geometries(labels_b, tolerance=0.5)
+    for label_id, poly in expected.items():
+        assert result[label_id].equals(poly), "stale geometry survived a mask change"
 
 
 def test_resume_disabled_recomputes_everything(tmp_path):

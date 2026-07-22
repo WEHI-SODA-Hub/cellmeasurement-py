@@ -20,6 +20,7 @@ Typical pipeline position
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -156,6 +157,11 @@ def _materialize_labels(label_arr: da.Array | np.ndarray) -> np.ndarray:
     if callable(compute_fn):
         return cast(np.ndarray, compute_fn())
     return np.asarray(label_arr)
+
+
+def _labels_digest(labels: np.ndarray) -> str:
+    """Short content hash so two different masks never share a checkpoint."""
+    return hashlib.blake2b(np.ascontiguousarray(labels), digest_size=8).hexdigest()
 
 
 def _label_bboxes(labels: np.ndarray) -> dict[int, tuple[int, int, int, int]]:
@@ -314,6 +320,7 @@ def extract_label_geometries(
                 "batch_size": int(batch_size),
                 "n_labels": len(bboxes),
                 "image_shape": [int(labels.shape[0]), int(labels.shape[1])],
+                "labels_digest": _labels_digest(labels),
             }
         )
 
