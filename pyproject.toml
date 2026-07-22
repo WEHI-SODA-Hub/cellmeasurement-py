@@ -1,6 +1,6 @@
 [project]
 name = "cellmeasurement-py"
-version = "0.1.2"
+version = "0.2.0"
 description = "Extract regions of interest from whole cell and nuclear mask images, calculate measurements and export to GeoJSON"
 readme = "README.md"
 authors = [

@@ -169,17 +169,43 @@ uv run cellmeasurement \
 | `--output-mask PATH`                                 | Optional rasterised label-mask TIFF output     | `None`                     |
 | `--simplify-rois / --no-simplify-rois`               | Douglas-Peucker polygon simplification         | `--simplify-rois`          |
 | `--tolerance FLOAT`                                  | Polygon simplification tolerance (px)          | `0.5`                      |
+| `--geometry-checkpoint-dir PATH`                     | Resumable polygon-extraction checkpoint dir    | `None`                     |
+| `--resume-geometry / --no-resume-geometry`           | Reuse existing geometry checkpoint shards      | `--resume-geometry`        |
+| `--geometry-batch-size INT`                          | Cells per polygon batch / checkpoint unit      | `2000`                     |
 | `--pretty-json / --no-pretty-json`                   | Write pretty-printed GeoJSON                   | `--no-pretty-json`         |
 | `--constrain-overlaps / --no-constrain-overlaps`     | Clip overlapping output polygons               | `--constrain-overlaps`     |
 | `--version`                                          | Print CLI version and exit                     | `False`                    |
 
 ## Performance notes
 
-- Measurement is the most expensive stage.
 - `--downsample-factor` can reduce memory and runtime substantially for large images.
-- `--threads` controls tile-level measurement worker count (process-based execution, serial fallback at 1).
+- `--threads` controls both measurement tile workers and polygon-extraction
+  workers (process-based execution, serial fallback at 1).
 - With `--threads > 1` and no downsampling, workers use TIFF window reads instead of materializing the full image array in RAM.
 - Use `--no-measurements` for quick geometry-only QC/export runs.
+
+### Resuming polygon extraction
+
+Polygon extraction dominates runtime on whole-slide images with millions of
+cells. `--geometry-checkpoint-dir` writes each completed batch to disk, so a run
+killed by wall-time or OOM resumes from the last completed batch instead of
+restarting:
+
+```bash
+cellmeasurement --whole-cell-mask mask.ome.tif --tiff-file image.ome.tif \
+    --threads 24 --geometry-checkpoint-dir /scratch/run1-checkpoints
+```
+
+Checkpoints are stored as compressed ragged coordinate arrays (~85 MB for 1.2M
+cells) and are namespaced per mask role, so nuclear and whole-cell geometries
+never share shards. A checkpoint is ignored — and discarded — if the run's
+settings (simplification, tolerance, batch size, mask dimensions, label count)
+differ from the ones that produced it. Checkpoints are not removed
+automatically; delete the directory after a successful run.
+
+When running under a workflow engine, point this at a path **outside** the
+per-task work directory, otherwise a retry allocated a fresh work directory will
+not find the checkpoint.
 
 ## Development
 

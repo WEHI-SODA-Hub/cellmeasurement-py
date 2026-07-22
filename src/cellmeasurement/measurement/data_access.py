@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -10,19 +9,19 @@ import numpy as np
 import tifffile
 import zarr
 
+from ..shared_array import SharedArraySpec, create_shared_array, open_shared_array
 from .models import TileBounds
+
+__all__ = [
+    "SharedArraySpec",
+    "create_shared_array",
+    "open_shared_array",
+    "TiffDataAccessSpec",
+    "infer_cyx_shape",
+]
 
 MaskKind = Literal["nucleus", "whole_cell"]
 _CHANNEL_AXIS_NAMES = ("C", "S", "Q", "I")
-
-
-@dataclass(frozen=True)
-class SharedArraySpec:
-    """Shared-memory metadata required to rebuild a NumPy view in workers."""
-
-    name: str
-    shape: tuple[int, ...]
-    dtype: str
 
 
 @dataclass(frozen=True)
@@ -46,27 +45,6 @@ class _CyxLayout:
     channel_axis_name: str | None
     transpose_order: tuple[int, int, int] | None
     cyx_shape: tuple[int, int, int]
-
-
-def create_shared_array(arr: np.ndarray) -> tuple[SharedArraySpec, SharedMemory]:
-    """Copy an array to shared memory and return its spec and backing handle."""
-    contiguous = np.ascontiguousarray(arr)
-    shm = SharedMemory(create=True, size=contiguous.nbytes)
-    shared_arr = np.ndarray(contiguous.shape, dtype=contiguous.dtype, buffer=shm.buf)
-    shared_arr[...] = contiguous
-    spec = SharedArraySpec(
-        name=shm.name,
-        shape=tuple(int(v) for v in contiguous.shape),
-        dtype=contiguous.dtype.str,
-    )
-    return spec, shm
-
-
-def open_shared_array(spec: SharedArraySpec) -> tuple[np.ndarray, SharedMemory]:
-    """Open a shared-memory array view from a parent-created spec."""
-    shm = SharedMemory(name=spec.name)
-    arr = np.ndarray(spec.shape, dtype=np.dtype(spec.dtype), buffer=shm.buf)
-    return arr, shm
 
 
 def infer_cyx_shape(shape: tuple[int, ...], axes: str | None) -> tuple[int, int, int]:
