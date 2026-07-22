@@ -308,6 +308,7 @@ def main(
     geometry_batch_size: Annotated[
         int,
         typer.Option(
+            min=1,
             help="Labels per geometry batch; also the checkpoint granularity.",
         ),
     ] = DEFAULT_GEOMETRY_BATCH_SIZE,
