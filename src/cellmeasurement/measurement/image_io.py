@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
-from .data_access import infer_cyx_shape
+from .data_access import infer_cyx_shape, open_image_tiff
 
 logger = logging.getLogger(__name__)
 OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
@@ -218,7 +218,7 @@ def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
     total_pages = 0
     selected_pages = 0
     try:
-        with tifffile.TiffFile(path) as tf:
+        with open_image_tiff(path) as tf:
             total_pages = len(tf.pages)
             if tf.series:
                 axes = tf.series[0].axes
@@ -284,7 +284,7 @@ def _load_tiff_image(path: Path) -> tuple[np.ndarray, list[str]]:
 
 def inspect_tiff_image(path: Path) -> tuple[tuple[int, int, int], str | None, tuple[int, ...], list[str]]:
     """Inspect TIFF metadata and return normalized image shape/channels without loading full image."""
-    with tifffile.TiffFile(path) as tf:
+    with open_image_tiff(path) as tf:
         if not tf.series:
             raise ValueError(f"TIFF file has no readable series: {path}")
         series = tf.series[0]

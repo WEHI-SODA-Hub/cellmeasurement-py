@@ -53,6 +53,44 @@ def test_load_tiff_image_name_mismatch_falls_back(monkeypatch, tmp_path):
     assert ch_names == ["Channel 1", "Channel 2"]
 
 
+def test_load_tiff_image_recovers_channels_when_shaped_splits_ome_series(shaped_split_ome_tiff):
+    names = ["DAPI", "CD8", "Pan-CK"]
+    tiff_path, data = shaped_split_ome_tiff(names)
+
+    # Sanity check the fixture actually reproduces the mis-detection.
+    with tifffile.TiffFile(tiff_path) as tf:
+        assert len(tf.series) == 3
+        assert tf.series[0].kind == "shaped"
+
+    image_cyx, ch_names = image_io._load_tiff_image(tiff_path)
+
+    assert image_cyx.shape == (3, 4, 5)
+    np.testing.assert_array_equal(image_cyx, data)
+    assert ch_names == names
+
+
+def test_inspect_tiff_image_recovers_channels_when_shaped_splits_ome_series(shaped_split_ome_tiff):
+    names = ["DAPI", "CD8", "Pan-CK"]
+    tiff_path, _ = shaped_split_ome_tiff(names)
+
+    cyx_shape, axes, source_shape, ch_names = image_io.inspect_tiff_image(tiff_path)
+
+    assert cyx_shape == (3, 4, 5)
+    assert axes == "CYX"
+    assert source_shape == (3, 4, 5)
+    assert ch_names == names
+
+
+def test_inspect_tiff_image_keeps_single_channel_for_plain_tiff(tmp_path):
+    tiff_path = tmp_path / "plain.tiff"
+    tifffile.imwrite(tiff_path, np.zeros((4, 5), dtype=np.uint16))
+
+    cyx_shape, _axes, _source_shape, ch_names = image_io.inspect_tiff_image(tiff_path)
+
+    assert cyx_shape == (1, 4, 5)
+    assert ch_names == ["Channel 1"]
+
+
 def test_channel_names_from_ome_reads_channel_name():
     class _FakeTF:
         ome_metadata = (
@@ -119,3 +157,21 @@ def test_select_non_mibi_fullres_pages_filters_by_first_page_shape():
     selected = image_io._select_non_mibi_fullres_pages(_FakeTF())
     assert len(selected) == 2
     assert all(page.shape == (100, 200) for page in selected)
+
+
+def test_inspect_tiff_image_preserves_well_formed_multichannel_ome(tmp_path):
+    """COMET-style OME-TIFFs already expose one (C, Y, X) 'ome' series; leave them alone."""
+    data = np.stack([np.full((4, 5), i + 1, dtype=np.uint16) for i in range(6)])
+    tiff_path = tmp_path / "comet_like.ome.tif"
+    tifffile.imwrite(tiff_path, data, ome=True)
+
+    with tifffile.TiffFile(tiff_path) as tf:
+        assert len(tf.series) == 1
+        assert tf.series[0].kind == "ome"
+
+    cyx_shape, axes, source_shape, ch_names = image_io.inspect_tiff_image(tiff_path)
+
+    assert cyx_shape == (6, 4, 5)
+    assert axes == "CYX"
+    assert source_shape == (6, 4, 5)
+    assert len(ch_names) == 6
