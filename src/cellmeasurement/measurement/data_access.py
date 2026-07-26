@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,10 @@ __all__ = [
     "open_shared_array",
     "TiffDataAccessSpec",
     "infer_cyx_shape",
+    "open_image_tiff",
 ]
+
+logger = logging.getLogger(__name__)
 
 MaskKind = Literal["nucleus", "whole_cell"]
 _CHANNEL_AXIS_NAMES = ("C", "S", "Q", "I")
@@ -50,6 +54,78 @@ class _CyxLayout:
 def infer_cyx_shape(shape: tuple[int, ...], axes: str | None) -> tuple[int, int, int]:
     """Infer normalized (C, Y, X) shape from source shape/axes metadata."""
     return _build_cyx_layout(shape=shape, axes=axes).cyx_shape
+
+
+def _series_cyx_shape(series: Any) -> tuple[int, int, int] | None:
+    """Return the normalized (C, Y, X) shape of a TIFF series, or None if unsupported."""
+    try:
+        shape = tuple(int(v) for v in series.shape)
+        axes = str(series.axes) if series.axes else None
+        return _build_cyx_layout(shape=shape, axes=axes).cyx_shape
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def open_image_tiff(path: str | Path) -> tifffile.TiffFile:
+    """Open an intensity TIFF, preferring OME series when tifffile's "shaped" detection
+    hides the channel axis.
+
+    OME-TIFFs that have been rewritten by tifffile carry a ``{"shape": [...]}``
+    description on every page after the first. tifffile's "shaped" series detection then
+    takes priority over the OME metadata and reports one single-channel series per page,
+    so callers reading ``series[0]`` only ever see the first channel. Re-opening with
+    ``is_shaped=False`` restores the ``(C, Y, X)`` series the OME metadata declares.
+
+    The OME interpretation is only adopted when it exposes more channels over the same
+    Y/X extent, so a file whose OME metadata is broken keeps the shaped interpretation.
+    """
+    path = Path(path)
+    tf = tifffile.TiffFile(path)
+    try:
+        if not tf.is_ome:
+            return tf
+        series = tf.series
+        if not series or series[0].kind != "shaped":
+            return tf
+        shaped_cyx = _series_cyx_shape(series[0])
+    except Exception:
+        tf.close()
+        raise
+
+    try:
+        ome_tf = tifffile.TiffFile(path, is_shaped=False)
+    except (TypeError, ValueError, OSError, tifffile.TiffFileError) as exc:
+        logger.debug("Could not re-open %s ignoring shaped metadata: %s", path, exc)
+        return tf
+
+    try:
+        ome_series = ome_tf.series
+        ome_cyx = _series_cyx_shape(ome_series[0]) if ome_series else None
+    except Exception as exc:
+        logger.debug("Could not read OME series from %s: %s", path, exc)
+        ome_tf.close()
+        return tf
+
+    improves = (
+        ome_cyx is not None
+        and shaped_cyx is not None
+        and ome_cyx[0] > shaped_cyx[0]
+        and ome_cyx[1:] == shaped_cyx[1:]
+    )
+    if not improves:
+        ome_tf.close()
+        return tf
+
+    logger.info(
+        "TIFF %s: tifffile 'shaped' metadata split the channel axis into %d series; "
+        "using OME metadata instead (channels=%d -> %d).",
+        path,
+        len(series),
+        shaped_cyx[0] if shaped_cyx else 0,
+        ome_cyx[0] if ome_cyx else 0,
+    )
+    tf.close()
+    return ome_tf
 
 
 def _is_array_like(node: Any) -> bool:
@@ -287,7 +363,7 @@ class TiffTileDataAccess:
             return
         try:
             if self._tiff is None:
-                self._tiff = tifffile.TiffFile(Path(self.tiff_spec.path))
+                self._tiff = open_image_tiff(self.tiff_spec.path)
             if self._store is None:
                 series = self._tiff.series[0]
                 self._store = series.aszarr()
