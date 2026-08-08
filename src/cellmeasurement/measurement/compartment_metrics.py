@@ -143,12 +143,10 @@ def add_erosion_measurements(
     The compartment is split into ``n_bins`` concentric shells from outside in.
     Bin boundaries are adaptive (equal-area targets), not fixed pixel depths.
 
-    For each bin we emit:
-    - geometric descriptors (``Area_px``, ``Area_Fraction``, ``Depth_px``)
-    - per-channel mean/median intensity inside that bin shell
-
-    ``Depth_px`` is cumulative erosion depth at the *inner* edge of the bin,
-    mirroring the historical llm_rewrite semantics.
+    For each bin we emit only per-channel mean/median intensity inside that bin
+    shell. Ring area and erosion depth are used to build the bins but are not
+    emitted: because the bins are equal-area by construction, their geometry is
+    fixed rather than a property of the cell.
     """
     for comp in ("CELL", "NUCLEUS"):
         base = comp_masks[comp]
@@ -160,13 +158,9 @@ def add_erosion_measurements(
         bin_boundaries = erosion_bins_for_mask(base, n_bins=n_bins)
         # Boundaries are cumulative masks; convert to mutually exclusive rings.
         prev_mask = base.astype(bool)
-        for bin_idx, (eroded_mask, depth_px) in enumerate(bin_boundaries, start=1):
+        for bin_idx, (eroded_mask, _depth_px) in enumerate(bin_boundaries, start=1):
             ring = prev_mask & ~eroded_mask
             ring_area = int(np.count_nonzero(ring))
-
-            props[f"{comp_name}: ErosionBin_{bin_idx}: Area_px"] = float(ring_area)
-            props[f"{comp_name}: ErosionBin_{bin_idx}: Area_Fraction"] = float(ring_area / base_area)
-            props[f"{comp_name}: ErosionBin_{bin_idx}: Depth_px"] = float(depth_px)
 
             if ring_area > 0:
                 for ci, ch in enumerate(ch_names):
@@ -230,7 +224,8 @@ def add_expansion_measurements(
     ``pixel_size_microns`` (already effective/scaled by any downsampling), then
     partitioned into ``n_bins`` approximately equal-area annular shells.
 
-    Emitted keys mirror erosion naming but use ``ExpansionBin_<N>``.
+    As with erosion, only per-channel intensity is emitted; keys mirror erosion
+    naming but use ``ExpansionBin_<N>``.
     """
     expansion_um = 20.0
     total_expansion_px = max(1, int(round(expansion_um / pixel_size_microns)))
@@ -246,13 +241,9 @@ def add_expansion_measurements(
 
     # As with erosion: cumulative boundaries -> disjoint annular ring bins.
     prev_mask = cm.copy()
-    for bin_idx, (dilated_mask, depth_px) in enumerate(bin_boundaries, start=1):
+    for bin_idx, (dilated_mask, _depth_px) in enumerate(bin_boundaries, start=1):
         ring = dilated_mask & ~prev_mask
         ring_area = int(np.count_nonzero(ring))
-
-        props[f"Cell: ExpansionBin_{bin_idx}: Area_px"] = float(ring_area)
-        props[f"Cell: ExpansionBin_{bin_idx}: Area_Fraction"] = float(ring_area / base_area)
-        props[f"Cell: ExpansionBin_{bin_idx}: Depth_px"] = float(depth_px)
 
         if ring_area > 0:
             for ci, ch in enumerate(ch_names):
