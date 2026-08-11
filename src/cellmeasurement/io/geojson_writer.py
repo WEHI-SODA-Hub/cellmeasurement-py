@@ -46,6 +46,28 @@ SynthGeoms = dict[int, Polygon]
 logger = logging.getLogger(__name__)
 
 
+# Deflate is understood by every TIFF reader in the stack (QuPath, ImageJ,
+# tifffile) and level 1 is the cheap end -- label data is so compressible that
+# the higher levels buy little for noticeably more CPU.
+MASK_COMPRESSION = "zlib"
+MASK_COMPRESSION_ARGS = {"level": 1}
+
+# Offsets in a classic TIFF are 32-bit, so the whole file must stay under 4 GB.
+CLASSIC_TIFF_LIMIT_BYTES = 4 * 1024**3
+
+# Narrowest first. Label IDs are positive, so unsigned types fit naturally and
+# halve the array whenever the count still fits uint16.
+_MASK_DTYPES = (np.uint16, np.uint32, np.uint64)
+
+
+def _mask_dtype(max_label: int) -> np.dtype:
+    """Return the narrowest unsigned dtype that can hold ``max_label``."""
+    for dtype in _MASK_DTYPES:
+        if max_label <= np.iinfo(dtype).max:
+            return np.dtype(dtype)
+    return np.dtype(np.uint64)
+
+
 def _rasterise_features_to_mask(
     features: list[dict],
     height: int,
@@ -80,8 +102,7 @@ def _rasterise_features_to_mask(
         max_id = max(max_id, cell_id)
         cell_geoms.append((geom.area, cell_id, geom))
 
-    dtype = np.int32 if max_id < (2**31) else np.int64
-    mask = np.zeros((height, width), dtype=dtype)
+    mask = np.zeros((height, width), dtype=_mask_dtype(max_id))
 
     # Largest cells first; smaller cells painted last win any contested pixels,
     # mirroring the "trim the larger by the smaller" rule of
@@ -365,13 +386,38 @@ def write_geojson(
     if output_mask is not None:
         t_mask_start = time.perf_counter()
         raster_mask = _rasterise_features_to_mask(features, H, W)
+        t_rasterise = time.perf_counter() - t_mask_start
         output_mask.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(output_mask), raster_mask)
+
+        # Label masks are long runs of a repeated ID, so they deflate to a small
+        # fraction of their raw size. Worth it: on a whole-slide export the write
+        # dominates total runtime, and it is the raw byte count that costs.
+        t_write_start = time.perf_counter()
+        # Classic TIFF caps at 4 GB. Compression normally keeps a whole-slide
+        # mask well under that, but falling back to BigTIFF only when the raw
+        # array is already over the limit avoids failing at the very last step
+        # of a multi-hour run if a mask happens to compress badly.
+        tifffile.imwrite(
+            str(output_mask),
+            raster_mask,
+            compression=MASK_COMPRESSION,
+            compressionargs=MASK_COMPRESSION_ARGS,
+            bigtiff=raster_mask.nbytes > CLASSIC_TIFF_LIMIT_BYTES,
+        )
+        t_write = time.perf_counter() - t_write_start
+
+        written = output_mask.stat().st_size
         logger.info(
-            "Raster mask export complete in %.2fs: path=%s, shape=%s",
+            "Raster mask export complete in %.2fs (rasterise=%.2fs, write=%.2fs): "
+            "path=%s, shape=%s, dtype=%s, %.2f GB raw -> %.2f GB on disk",
             time.perf_counter() - t_mask_start,
+            t_rasterise,
+            t_write,
             output_mask,
             raster_mask.shape,
+            raster_mask.dtype.name,
+            raster_mask.nbytes / 1e9,
+            written / 1e9,
         )
 
     logger.info("GeoJSON export total complete in %.2fs", time.perf_counter() - t_start)

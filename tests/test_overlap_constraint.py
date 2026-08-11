@@ -4,10 +4,12 @@ import gzip
 from pathlib import Path
 import json
 
+import numpy as np
+import pytest
 import tifffile
 from shapely.geometry import MultiPolygon, Polygon, shape
 
-from cellmeasurement.io.geojson_writer import write_geojson
+from cellmeasurement.io.geojson_writer import _mask_dtype, write_geojson
 from cellmeasurement.geometry.overlap_constraint import (
     _candidate_pairs,
     constrain_cell_overlaps,
@@ -310,6 +312,70 @@ def test_write_geojson_gzip_output(tmp_path: Path):
         data = json.load(f)
     assert data["type"] == "FeatureCollection"
     assert len(data["features"]) == 2
+
+
+# ----------------------------------------------------------------------------
+# raster mask export
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "max_label, expected",
+    [
+        (1, "uint16"),
+        (65535, "uint16"),  # boundary: still fits
+        (65536, "uint32"),  # boundary: must widen
+        (300_000, "uint32"),
+        (2**32, "uint64"),
+    ],
+)
+def test_mask_dtype_picks_narrowest_unsigned_type(max_label, expected):
+    assert _mask_dtype(max_label).name == expected
+
+
+def test_rasterisation_mask_is_compressed_and_round_trips(tmp_path: Path):
+    """The mask write dominates whole-slide runtime, and it is raw bytes that
+    cost. Compression must not change what comes back out."""
+    cells, wc_geoms = [], {}
+    for cell_id in range(1, 21):
+        x = (cell_id % 5) * 20
+        y = (cell_id // 5) * 20
+        cells.append(
+            CellMatch(
+                cell_id=cell_id,
+                nucleus_label=None,
+                whole_cell_label=cell_id,
+                bbox=(y, x, y + 10, x + 10),
+                centroid=(y + 5.0, x + 5.0),
+                nucleus_area_px=0,
+                cell_area_px=100,
+                overlap_px=0,
+                overlap_fraction=0.0,
+                match_source="wc_only",
+            )
+        )
+        wc_geoms[cell_id] = _square(x, y, 10)
+
+    mask_path = tmp_path / "cells_rasterisation.tiff"
+    write_geojson(
+        cells=cells,
+        nuc_geoms=None,
+        wc_geoms=wc_geoms,
+        synth_geoms={},
+        output_path=tmp_path / "cells.geojson",
+        image_shape=(200, 200),
+        constrain_overlaps=False,
+        output_mask=mask_path,
+    )
+
+    with tifffile.TiffFile(mask_path) as tif:
+        page = tif.pages[0]
+        assert page.compression != 1  # 1 == COMPRESSION.NONE
+
+    mask = tifffile.imread(mask_path)
+    assert mask.dtype == np.uint16  # 20 labels: narrowest that fits
+    assert mask.shape == (200, 200)
+    assert set(np.unique(mask)) == set(range(0, 21))  # every cell survived
 
 
 def test_write_geojson_rasterisation_output(tmp_path: Path):
