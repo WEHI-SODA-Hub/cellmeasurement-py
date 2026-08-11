@@ -46,17 +46,14 @@ SynthGeoms = dict[int, Polygon]
 logger = logging.getLogger(__name__)
 
 
-# Deflate is understood by every TIFF reader in the stack (QuPath, ImageJ,
-# tifffile) and level 1 is the cheap end -- label data is so compressible that
-# the higher levels buy little for noticeably more CPU.
+# Label masks are long runs of a repeated ID, so deflate shrinks them ~90x.
 MASK_COMPRESSION = "zlib"
 MASK_COMPRESSION_ARGS = {"level": 1}
 
 # Offsets in a classic TIFF are 32-bit, so the whole file must stay under 4 GB.
 CLASSIC_TIFF_LIMIT_BYTES = 4 * 1024**3
 
-# Narrowest first. Label IDs are positive, so unsigned types fit naturally and
-# halve the array whenever the count still fits uint16.
+# Narrowest first. Label IDs are positive, so unsigned fits and stays smaller.
 _MASK_DTYPES = (np.uint16, np.uint32, np.uint64)
 
 
@@ -389,14 +386,10 @@ def write_geojson(
         t_rasterise = time.perf_counter() - t_mask_start
         output_mask.parent.mkdir(parents=True, exist_ok=True)
 
-        # Label masks are long runs of a repeated ID, so they deflate to a small
-        # fraction of their raw size. Worth it: on a whole-slide export the write
-        # dominates total runtime, and it is the raw byte count that costs.
+        # The write dominates whole-slide runtime, and raw byte count is the cost.
         t_write_start = time.perf_counter()
-        # Classic TIFF caps at 4 GB. Compression normally keeps a whole-slide
-        # mask well under that, but falling back to BigTIFF only when the raw
-        # array is already over the limit avoids failing at the very last step
-        # of a multi-hour run if a mask happens to compress badly.
+        # BigTIFF only past the 4 GB classic limit, so a badly compressing mask
+        # cannot fail at the last step of a multi-hour run.
         tifffile.imwrite(
             str(output_mask),
             raster_mask,

@@ -21,11 +21,8 @@ log = logging.getLogger(__name__)
 
 __all__ = ["constrain_cell_overlaps"]
 
-# Wall-clock gap between trim-loop progress lines.
-_PROGRESS_SECONDS = 60.0
-
-# Iterations between clock reads, so the timer costs nothing in the hot loop.
-_PROGRESS_STRIDE = 1024
+_PROGRESS_SECONDS = 60.0   # wall-clock gap between progress lines
+_PROGRESS_STRIDE = 1024    # iterations between clock reads
 
 
 def _ensure_largest_polygon(geom: Any) -> Polygon:
@@ -61,10 +58,9 @@ def _geometry_array(geoms: list[Any]) -> np.ndarray:
 def _candidate_pairs(geoms: list[Any]) -> np.ndarray:
     """Return ``(i, j)`` index pairs, ``i < j``, whose geometries intersect.
 
-    An STRtree resolves both the bounding-box filter and the ``intersects``
-    predicate in C against prepared geometries. The area test stays in the trim
-    loop: geometries are edited in place as the pass runs, so overlap has to be
-    re-checked against the current geometry rather than settled up front.
+    The STRtree does the bbox filter and the ``intersects`` predicate in C. The
+    area test stays in the trim loop because geometries are edited in place, so
+    overlap must be re-checked against the current geometry.
     """
     empty = np.empty((0, 2), dtype=np.intp)
     if len(geoms) < 2:
@@ -74,8 +70,7 @@ def _candidate_pairs(geoms: list[Any]) -> np.ndarray:
     geom_arr = _geometry_array(geoms)
     left, right = shapely.STRtree(geom_arr).query(geom_arr, predicate="intersects")
 
-    # query() reports self-hits and both directions of every pair; keep one
-    # ordered copy of each distinct pair.
+    # query() reports self-hits and both directions; keep one copy of each pair.
     upper = left < right
     left, right = left[upper], right[upper]
     if left.size == 0:
@@ -165,9 +160,7 @@ def constrain_cell_overlaps(features: list[dict[str, Any]]) -> list[dict[str, An
     pairs = _candidate_pairs(geoms)
     total = len(pairs)
 
-    # Geometries are trimmed in place, so a pair can stop overlapping before its
-    # turn comes round; _trim_larger_cell re-checks rather than trusting the
-    # broad phase.
+    # A pair can stop overlapping before its turn, so _trim_larger_cell re-checks.
     clipped = 0
     next_report = time.perf_counter() + _PROGRESS_SECONDS
     for k in range(total):
