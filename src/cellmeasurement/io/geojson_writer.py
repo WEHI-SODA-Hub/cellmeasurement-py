@@ -65,6 +65,26 @@ def _mask_dtype(max_label: int) -> np.dtype:
     return np.dtype(np.uint64)
 
 
+_BIGTIFF_RETRY_EXCEPTIONS = (ValueError, OverflowError, OSError)
+_BIGTIFF_RETRY_HINTS = (
+    "bigtiff",
+    "classic tiff",
+    "4 gb",
+    "4gb",
+    "offset",
+    "ifd",
+    "too large",
+    "out of range",
+    "cannot fit",
+)
+
+
+def _is_classic_tiff_size_error(exc: Exception) -> bool:
+    """Return True if an exception indicates classic-TIFF size/offset overflow."""
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _BIGTIFF_RETRY_HINTS)
+
+
 def _rasterise_features_to_mask(
     features: list[dict],
     height: int,
@@ -388,15 +408,33 @@ def write_geojson(
 
         # The write dominates whole-slide runtime, and raw byte count is the cost.
         t_write_start = time.perf_counter()
-        # BigTIFF only past the 4 GB classic limit, so a badly compressing mask
-        # cannot fail at the last step of a multi-hour run.
-        tifffile.imwrite(
-            str(output_mask),
-            raster_mask,
-            compression=MASK_COMPRESSION,
-            compressionargs=MASK_COMPRESSION_ARGS,
-            bigtiff=raster_mask.nbytes > CLASSIC_TIFF_LIMIT_BYTES,
-        )
+
+        # BigTIFF is required when the written file exceeds the classic TIFF
+        # limit. Start with a conservative raw-size check, then retry in
+        # BigTIFF mode only for explicit classic-TIFF size/offset failures.
+        bigtiff = raster_mask.nbytes >= CLASSIC_TIFF_LIMIT_BYTES
+        try:
+            tifffile.imwrite(
+                str(output_mask),
+                raster_mask,
+                compression=MASK_COMPRESSION,
+                compressionargs=MASK_COMPRESSION_ARGS,
+                bigtiff=bigtiff,
+            )
+        except _BIGTIFF_RETRY_EXCEPTIONS as exc:
+            if bigtiff or not _is_classic_tiff_size_error(exc):
+                raise
+            logger.warning(
+                "Raster mask write failed in classic TIFF mode (%s); retrying as BigTIFF.",
+                exc,
+            )
+            tifffile.imwrite(
+                str(output_mask),
+                raster_mask,
+                compression=MASK_COMPRESSION,
+                compressionargs=MASK_COMPRESSION_ARGS,
+                bigtiff=True,
+            )
         t_write = time.perf_counter() - t_write_start
 
         written = output_mask.stat().st_size

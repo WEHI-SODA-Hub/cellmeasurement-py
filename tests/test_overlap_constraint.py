@@ -9,6 +9,7 @@ import pytest
 import tifffile
 from shapely.geometry import MultiPolygon, Polygon, shape
 
+import cellmeasurement.io.geojson_writer as geojson_writer_module
 from cellmeasurement.io.geojson_writer import _mask_dtype, write_geojson
 from cellmeasurement.geometry.overlap_constraint import (
     _candidate_pairs,
@@ -410,3 +411,76 @@ def test_write_geojson_rasterisation_output(tmp_path: Path):
     mask = tifffile.imread(mask_path)
     assert int(mask.max()) == 1
     assert int(mask[3, 3]) == 1
+
+
+def test_write_geojson_retries_mask_write_as_bigtiff_on_classic_limit_error(tmp_path: Path, monkeypatch):
+    calls: list[bool] = []
+
+    def _fake_imwrite(path, data, *, compression, compressionargs, bigtiff):
+        calls.append(bool(bigtiff))
+        if len(calls) == 1:
+            raise ValueError("data too large for classic TIFF format")
+        Path(path).write_bytes(b"ok")
+
+    monkeypatch.setattr(geojson_writer_module.tifffile, "imwrite", _fake_imwrite)
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    write_geojson(
+        cells=[cell],
+        nuc_geoms=None,
+        wc_geoms={1: Polygon([(2, 2), (5, 2), (5, 5), (2, 5)])},
+        synth_geoms={},
+        output_path=tmp_path / "cells.geojson",
+        image_shape=(10, 10),
+        constrain_overlaps=False,
+        output_mask=tmp_path / "cells_rasterisation.tiff",
+    )
+
+    assert calls == [False, True]
+
+
+def test_write_geojson_mask_write_does_not_retry_unrelated_error(tmp_path: Path, monkeypatch):
+    calls: list[bool] = []
+
+    def _fake_imwrite(path, data, *, compression, compressionargs, bigtiff):
+        calls.append(bool(bigtiff))
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(geojson_writer_module.tifffile, "imwrite", _fake_imwrite)
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    with pytest.raises(OSError, match="permission denied"):
+        write_geojson(
+            cells=[cell],
+            nuc_geoms=None,
+            wc_geoms={1: Polygon([(2, 2), (5, 2), (5, 5), (2, 5)])},
+            synth_geoms={},
+            output_path=tmp_path / "cells.geojson",
+            image_shape=(10, 10),
+            constrain_overlaps=False,
+            output_mask=tmp_path / "cells_rasterisation.tiff",
+        )
+
+    assert calls == [False]
