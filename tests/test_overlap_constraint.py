@@ -5,11 +5,18 @@ from pathlib import Path
 import json
 
 import tifffile
-from shapely.geometry import Polygon, shape
+from shapely.geometry import MultiPolygon, Polygon, shape
 
 from cellmeasurement.io.geojson_writer import write_geojson
-from cellmeasurement.geometry.overlap_constraint import constrain_cell_overlaps
+from cellmeasurement.geometry.overlap_constraint import (
+    _candidate_pairs,
+    constrain_cell_overlaps,
+)
 from cellmeasurement.segmentation.cell import CellMatch
+
+
+def _square(x0: float, y0: float, size: float = 2.0) -> Polygon:
+    return Polygon([(x0, y0), (x0 + size, y0), (x0 + size, y0 + size), (x0, y0 + size)])
 
 
 def _feature(cell_id: int, cell_poly: Polygon, nucleus_poly: Polygon | None = None) -> dict:
@@ -66,6 +73,74 @@ def test_constrain_overlaps_clips_or_removes_nucleus_geometry():
 
     assert len(out) == 1
     assert "nucleusGeometry" not in out[0]
+
+
+# ----------------------------------------------------------------------------
+# broad phase
+# ----------------------------------------------------------------------------
+
+
+def test_candidate_pairs_returns_ordered_unique_pairs():
+    # Three mutually overlapping squares.
+    geoms = [_square(0, 0, 4), _square(1, 1, 4), _square(2, 2, 4)]
+
+    pairs = [tuple(p) for p in _candidate_pairs(geoms)]
+
+    assert pairs == [(0, 1), (0, 2), (1, 2)]  # i < j, sorted, no self-hits
+
+
+def test_candidate_pairs_excludes_distant_cells():
+    geoms = [_square(0, 0), _square(1000, 1000), _square(2000, 2000)]
+
+    assert len(_candidate_pairs(geoms)) == 0
+
+
+def test_candidate_pairs_handles_degenerate_input():
+    assert len(_candidate_pairs([])) == 0
+    assert len(_candidate_pairs([_square(0, 0)])) == 0
+
+
+def test_touching_cells_are_not_trimmed():
+    """Shared boundaries are not overlaps.
+
+    The broad phase uses an ``intersects`` predicate, which matches edge-to-edge
+    neighbours. The zero-area check in the trim step is what keeps them intact,
+    and adjacent cells are the common case in a real segmentation.
+    """
+    left = _square(0, 0)
+    right = _square(2, 0)  # shares the x=2 edge exactly
+    assert left.intersection(right).area == 0
+
+    out = constrain_cell_overlaps([_feature(1, left), _feature(2, right)])
+
+    assert len(out) == 2
+    assert shape(out[0]["geometry"]).area == left.area
+    assert shape(out[1]["geometry"]).area == right.area
+
+
+def test_scattered_multipart_cell_is_trimmed_locally():
+    """A label whose parts are spread across the image (the uint16 wraparound
+    shape) must only clip the neighbour it actually touches."""
+    scattered = MultiPolygon([_square(0, 0, 4), _square(1000, 1000, 4)])
+    neighbour = _square(2, 2, 4)  # overlaps the first part only
+    far = _square(500, 500)  # inside the multipart bbox, touching nothing
+
+    out = constrain_cell_overlaps(
+        [_feature(1, scattered), _feature(2, neighbour), _feature(3, far)]
+    )
+
+    by_id = {f["properties"]["id"]: shape(f["geometry"]) for f in out}
+    assert by_id[3].area == far.area  # untouched despite the enclosing bbox
+    assert by_id[1].intersection(by_id[2]).area < 1e-10
+
+
+def test_constrain_overlaps_is_deterministic():
+    features = [_feature(i, _square(i * 1.5, 0, 4)) for i in range(6)]
+
+    first = constrain_cell_overlaps([dict(f) for f in features])
+    second = constrain_cell_overlaps([dict(f) for f in features])
+
+    assert [f["geometry"] for f in first] == [f["geometry"] for f in second]
 
 
 def test_write_geojson_can_disable_overlap_constraint(tmp_path: Path):
