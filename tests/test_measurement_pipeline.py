@@ -96,8 +96,8 @@ def test_measure_cells_tiled_basic(tmp_path: Path):
     assert props["Channel 1: Cell: Mean"] == 40.0
     assert props["Channel 1: Nucleus: Mean"] == 40.0
     assert props["Channel 1: Cell: Percentile: 50.0"] == 40.0
-    assert any(k.startswith("Cell: ErosionBin_") for k in props)
-    assert any(k.startswith("Cell: ExpansionBin_") for k in props)
+    assert any("Cell: ErosionBin_" in k for k in props)
+    assert any("Cell: ExpansionBin_" in k for k in props)
 
 
 def test_measure_cells_tiled_process_workers_match_serial(tmp_path: Path):
@@ -453,8 +453,8 @@ def test_measure_cells_tiled_can_disable_erosion_and_expansion(tmp_path: Path):
     )
 
     props = measured[1]
-    assert not any(k.startswith("Cell: ErosionBin_") for k in props)
-    assert not any(k.startswith("Cell: ExpansionBin_") for k in props)
+    assert not any("Cell: ErosionBin_" in k for k in props)
+    assert not any("Cell: ExpansionBin_" in k for k in props)
 
 
 def test_measure_cells_tiled_environment_expansion(tmp_path: Path):

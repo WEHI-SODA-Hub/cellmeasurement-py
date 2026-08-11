@@ -59,25 +59,36 @@ def test_erosion_bin_areas_monotonic_non_increasing() -> None:
     assert all(curr <= prev for prev, curr in zip(areas, areas[1:]))
 
 
-def test_add_erosion_measurements_ring_areas_cover_cell_mask() -> None:
+def _erosion_ring_areas(mask: np.ndarray, n_bins: int = 5) -> list[int]:
+    """Ring pixel counts implied by the cumulative erosion boundaries."""
+    prev = mask.astype(bool)
+    areas: list[int] = []
+    for eroded, _ in erosion_bins_for_mask(mask, n_bins=n_bins):
+        areas.append(int(np.count_nonzero(prev & ~eroded)))
+        prev = eroded
+    return areas
+
+
+def _expansion_ring_areas(mask: np.ndarray, total_expansion_px: int, n_bins: int = 5) -> list[int]:
+    """Ring pixel counts implied by the cumulative expansion boundaries."""
+    prev = mask.astype(bool)
+    areas: list[int] = []
+    for dilated, _ in expansion_bins_for_mask(mask, total_expansion_px, n_bins=n_bins):
+        areas.append(int(np.count_nonzero(dilated & ~prev)))
+        prev = dilated
+    return areas
+
+
+def test_erosion_bin_rings_tile_the_mask() -> None:
     mask = _circular_mask(25)
-    image = np.ones((1, *mask.shape), dtype=np.float32) * 42.0
-    props: dict[str, float] = {}
-    add_erosion_measurements(props, image, ["ch1"], _default_comp_masks(mask), n_bins=5)
-
-    total_area = int(np.count_nonzero(mask))
-    ring_areas = [props[f"Cell: ErosionBin_{i}: Area_px"] for i in range(1, 6)]
-    assert sum(ring_areas) == total_area
+    assert sum(_erosion_ring_areas(mask)) == int(np.count_nonzero(mask))
 
 
-def test_add_erosion_measurements_fractions_sum_to_one() -> None:
+def test_erosion_bin_rings_are_roughly_equal_area() -> None:
     mask = _circular_mask(25)
-    image = np.ones((1, *mask.shape), dtype=np.float32)
-    props: dict[str, float] = {}
-    add_erosion_measurements(props, image, ["ch1"], _default_comp_masks(mask), n_bins=5)
-
-    fracs = [props[f"Cell: ErosionBin_{i}: Area_Fraction"] for i in range(1, 6)]
-    assert abs(sum(fracs) - 1.0) < 1e-9
+    total = int(np.count_nonzero(mask))
+    for area in _erosion_ring_areas(mask):
+        assert abs(area / total - 0.2) < 0.05
 
 
 def test_add_erosion_measurements_uniform_intensity_per_bin() -> None:
@@ -86,10 +97,9 @@ def test_add_erosion_measurements_uniform_intensity_per_bin() -> None:
     props: dict[str, float] = {}
     add_erosion_measurements(props, image, ["ch1"], _default_comp_masks(mask), n_bins=5)
 
-    for i in range(1, 6):
-        area = props[f"Cell: ErosionBin_{i}: Area_px"]
+    for i, ring_area in enumerate(_erosion_ring_areas(mask), start=1):
         key = f"ch1: Cell: ErosionBin_{i}: Mean"
-        if area > 0:
+        if ring_area > 0:
             assert key in props
             assert abs(props[key] - 7.0) < 1e-6
         else:
@@ -120,18 +130,15 @@ def test_add_erosion_measurements_produces_nucleus_bins() -> None:
     add_erosion_measurements(props, image, ["ch1"], _default_comp_masks(cell, nucleus), n_bins=5)
 
     for i in range(1, 6):
-        assert f"Nucleus: ErosionBin_{i}: Area_px" in props
+        assert f"ch1: Nucleus: ErosionBin_{i}: Mean" in props
 
 
-def test_add_erosion_measurements_nucleus_ring_areas_sum_to_nucleus_area() -> None:
+def test_add_erosion_measurements_nucleus_rings_tile_the_nucleus() -> None:
     cell = _circular_mask(25)
     nucleus = _circular_mask(12, size=cell.shape[0])
-    image = np.ones((1, *cell.shape), dtype=np.float32)
-    props: dict[str, float] = {}
 
-    add_erosion_measurements(props, image, ["ch1"], _default_comp_masks(cell, nucleus), n_bins=5)
-    ring_sum = sum(props[f"Nucleus: ErosionBin_{i}: Area_px"] for i in range(1, 6))
-    assert ring_sum == int(np.count_nonzero(nucleus))
+    nuc_mask = _default_comp_masks(cell, nucleus)["NUCLEUS"]
+    assert sum(_erosion_ring_areas(nuc_mask)) == int(np.count_nonzero(nucleus))
 
 
 def test_expansion_bins_returns_requested_count() -> None:
@@ -163,10 +170,9 @@ def test_add_expansion_measurements_uniform_intensity_per_bin() -> None:
     props: dict[str, float] = {}
     add_expansion_measurements(props, image, ["ch1"], mask, pixel_size_microns=0.5, n_bins=5)
 
-    for i in range(1, 6):
-        area = props[f"Cell: ExpansionBin_{i}: Area_px"]
+    for i, ring_area in enumerate(_expansion_ring_areas(mask, total_expansion_px=40), start=1):
         key = f"ch1: Cell: ExpansionBin_{i}: Mean"
-        if area > 0:
+        if ring_area > 0:
             assert key in props
             assert abs(props[key] - 9.0) < 1e-6
 
@@ -186,17 +192,21 @@ def test_add_expansion_measurements_radial_gradient_increases_outward() -> None:
 
 
 def test_add_expansion_measurements_pixel_size_controls_total_expansion_area() -> None:
-    mask = _circular_mask(15, size=300)
-    image = np.ones((1, *mask.shape), dtype=np.float32)
+    size = 300
+    mask = _circular_mask(15, size=size)
+    centre = size // 2
+    yy, xx = np.ogrid[:size, :size]
+    dist = np.sqrt((xx - centre) ** 2 + (yy - centre) ** 2).astype(np.float32)
+    image = dist[np.newaxis, :, :]
 
     coarse_props: dict[str, float] = {}
     add_expansion_measurements(coarse_props, image, ["ch1"], mask, pixel_size_microns=1.0, n_bins=5)
     fine_props: dict[str, float] = {}
     add_expansion_measurements(fine_props, image, ["ch1"], mask, pixel_size_microns=0.5, n_bins=5)
 
-    coarse_total = sum(coarse_props.get(f"Cell: ExpansionBin_{i}: Area_px", 0.0) for i in range(1, 6))
-    fine_total = sum(fine_props.get(f"Cell: ExpansionBin_{i}: Area_px", 0.0) for i in range(1, 6))
-    assert fine_total > coarse_total
+    # Smaller pixels put more of them in 20 µm, so the outermost ring sits further
+    # from the cell -- visible as a higher mean on a radial-distance image.
+    assert fine_props["ch1: Cell: ExpansionBin_5: Mean"] > coarse_props["ch1: Cell: ExpansionBin_5: Mean"]
 
 
 def test_expansion_bin1_contains_immediate_adjacent_ring() -> None:
