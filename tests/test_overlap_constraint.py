@@ -4,12 +4,22 @@ import gzip
 from pathlib import Path
 import json
 
+import numpy as np
+import pytest
 import tifffile
-from shapely.geometry import Polygon, shape
+from shapely.geometry import MultiPolygon, Polygon, shape
 
-from cellmeasurement.io.geojson_writer import write_geojson
-from cellmeasurement.geometry.overlap_constraint import constrain_cell_overlaps
+import cellmeasurement.io.geojson_writer as geojson_writer_module
+from cellmeasurement.io.geojson_writer import _mask_dtype, write_geojson
+from cellmeasurement.geometry.overlap_constraint import (
+    _candidate_pairs,
+    constrain_cell_overlaps,
+)
 from cellmeasurement.segmentation.cell import CellMatch
+
+
+def _square(x0: float, y0: float, size: float = 2.0) -> Polygon:
+    return Polygon([(x0, y0), (x0 + size, y0), (x0 + size, y0 + size), (x0, y0 + size)])
 
 
 def _feature(cell_id: int, cell_poly: Polygon, nucleus_poly: Polygon | None = None) -> dict:
@@ -66,6 +76,74 @@ def test_constrain_overlaps_clips_or_removes_nucleus_geometry():
 
     assert len(out) == 1
     assert "nucleusGeometry" not in out[0]
+
+
+# ----------------------------------------------------------------------------
+# broad phase
+# ----------------------------------------------------------------------------
+
+
+def test_candidate_pairs_returns_ordered_unique_pairs():
+    # Three mutually overlapping squares.
+    geoms = [_square(0, 0, 4), _square(1, 1, 4), _square(2, 2, 4)]
+
+    pairs = [tuple(p) for p in _candidate_pairs(geoms)]
+
+    assert pairs == [(0, 1), (0, 2), (1, 2)]  # i < j, sorted, no self-hits
+
+
+def test_candidate_pairs_excludes_distant_cells():
+    geoms = [_square(0, 0), _square(1000, 1000), _square(2000, 2000)]
+
+    assert len(_candidate_pairs(geoms)) == 0
+
+
+def test_candidate_pairs_handles_degenerate_input():
+    assert len(_candidate_pairs([])) == 0
+    assert len(_candidate_pairs([_square(0, 0)])) == 0
+
+
+def test_touching_cells_are_not_trimmed():
+    """Shared boundaries are not overlaps.
+
+    The broad phase uses an ``intersects`` predicate, which matches edge-to-edge
+    neighbours. The zero-area check in the trim step is what keeps them intact,
+    and adjacent cells are the common case in a real segmentation.
+    """
+    left = _square(0, 0)
+    right = _square(2, 0)  # shares the x=2 edge exactly
+    assert left.intersection(right).area == 0
+
+    out = constrain_cell_overlaps([_feature(1, left), _feature(2, right)])
+
+    assert len(out) == 2
+    assert shape(out[0]["geometry"]).area == left.area
+    assert shape(out[1]["geometry"]).area == right.area
+
+
+def test_scattered_multipart_cell_is_trimmed_locally():
+    """A label whose parts are spread across the image (the uint16 wraparound
+    shape) must only clip the neighbour it actually touches."""
+    scattered = MultiPolygon([_square(0, 0, 4), _square(1000, 1000, 4)])
+    neighbour = _square(2, 2, 4)  # overlaps the first part only
+    far = _square(500, 500)  # inside the multipart bbox, touching nothing
+
+    out = constrain_cell_overlaps(
+        [_feature(1, scattered), _feature(2, neighbour), _feature(3, far)]
+    )
+
+    by_id = {f["properties"]["id"]: shape(f["geometry"]) for f in out}
+    assert by_id[3].area == far.area  # untouched despite the enclosing bbox
+    assert by_id[1].intersection(by_id[2]).area < 1e-10
+
+
+def test_constrain_overlaps_is_deterministic():
+    features = [_feature(i, _square(i * 1.5, 0, 4)) for i in range(6)]
+
+    first = constrain_cell_overlaps([dict(f) for f in features])
+    second = constrain_cell_overlaps([dict(f) for f in features])
+
+    assert [f["geometry"] for f in first] == [f["geometry"] for f in second]
 
 
 def test_write_geojson_can_disable_overlap_constraint(tmp_path: Path):
@@ -237,6 +315,77 @@ def test_write_geojson_gzip_output(tmp_path: Path):
     assert len(data["features"]) == 2
 
 
+# ----------------------------------------------------------------------------
+# raster mask export
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "max_label, expected",
+    [
+        (1, "uint16"),
+        (65535, "uint16"),  # boundary: still fits
+        (65536, "uint32"),  # boundary: must widen
+        (300_000, "uint32"),
+        (2**32 - 1, "uint32"),  # boundary: still fits uint32
+    ],
+)
+def test_mask_dtype_picks_narrowest_unsigned_type(max_label, expected):
+    assert _mask_dtype(max_label).name == expected
+
+
+def test_mask_dtype_rejects_counts_beyond_uint32():
+    # The mask reader (io/mask_io.py) rejects >32-bit label masks, so the writer
+    # must not emit one either -- raise rather than silently widen to uint64.
+    with pytest.raises(ValueError, match="exceeds the"):
+        _mask_dtype(2**32)
+
+
+def test_rasterisation_mask_is_uncompressed_and_round_trips(tmp_path: Path):
+    """The exported mask is viewer-facing, so it is written uncompressed: any
+    reader opens it and it stays memmap-able. Content must round-trip intact."""
+    cells, wc_geoms = [], {}
+    for cell_id in range(1, 21):
+        x = (cell_id % 5) * 20
+        y = (cell_id // 5) * 20
+        cells.append(
+            CellMatch(
+                cell_id=cell_id,
+                nucleus_label=None,
+                whole_cell_label=cell_id,
+                bbox=(y, x, y + 10, x + 10),
+                centroid=(y + 5.0, x + 5.0),
+                nucleus_area_px=0,
+                cell_area_px=100,
+                overlap_px=0,
+                overlap_fraction=0.0,
+                match_source="wc_only",
+            )
+        )
+        wc_geoms[cell_id] = _square(x, y, 10)
+
+    mask_path = tmp_path / "cells_rasterisation.tiff"
+    write_geojson(
+        cells=cells,
+        nuc_geoms=None,
+        wc_geoms=wc_geoms,
+        synth_geoms={},
+        output_path=tmp_path / "cells.geojson",
+        image_shape=(200, 200),
+        constrain_overlaps=False,
+        output_mask=mask_path,
+    )
+
+    with tifffile.TiffFile(mask_path) as tif:
+        page = tif.pages[0]
+        assert page.compression == 1  # 1 == COMPRESSION.NONE
+
+    mask = tifffile.imread(mask_path)
+    assert mask.dtype == np.uint16  # 20 labels: narrowest that fits
+    assert mask.shape == (200, 200)
+    assert set(np.unique(mask)) == set(range(0, 21))  # every cell survived
+
+
 def test_write_geojson_rasterisation_output(tmp_path: Path):
     cell = CellMatch(
         cell_id=1,
@@ -269,3 +418,76 @@ def test_write_geojson_rasterisation_output(tmp_path: Path):
     mask = tifffile.imread(mask_path)
     assert int(mask.max()) == 1
     assert int(mask[3, 3]) == 1
+
+
+def test_write_geojson_retries_mask_write_as_bigtiff_on_classic_limit_error(tmp_path: Path, monkeypatch):
+    calls: list[bool] = []
+
+    def _fake_imwrite(path, data, *, bigtiff):
+        calls.append(bool(bigtiff))
+        if len(calls) == 1:
+            raise ValueError("data too large for classic TIFF format")
+        Path(path).write_bytes(b"ok")
+
+    monkeypatch.setattr(geojson_writer_module.tifffile, "imwrite", _fake_imwrite)
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    write_geojson(
+        cells=[cell],
+        nuc_geoms=None,
+        wc_geoms={1: Polygon([(2, 2), (5, 2), (5, 5), (2, 5)])},
+        synth_geoms={},
+        output_path=tmp_path / "cells.geojson",
+        image_shape=(10, 10),
+        constrain_overlaps=False,
+        output_mask=tmp_path / "cells_rasterisation.tiff",
+    )
+
+    assert calls == [False, True]
+
+
+def test_write_geojson_mask_write_does_not_retry_unrelated_error(tmp_path: Path, monkeypatch):
+    calls: list[bool] = []
+
+    def _fake_imwrite(path, data, *, bigtiff):
+        calls.append(bool(bigtiff))
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(geojson_writer_module.tifffile, "imwrite", _fake_imwrite)
+
+    cell = CellMatch(
+        cell_id=1,
+        nucleus_label=None,
+        whole_cell_label=1,
+        bbox=(0, 0, 2, 2),
+        centroid=(1.0, 1.0),
+        nucleus_area_px=0,
+        cell_area_px=4,
+        overlap_px=0,
+        overlap_fraction=0.0,
+        match_source="wc_only",
+    )
+    with pytest.raises(OSError, match="permission denied"):
+        write_geojson(
+            cells=[cell],
+            nuc_geoms=None,
+            wc_geoms={1: Polygon([(2, 2), (5, 2), (5, 5), (2, 5)])},
+            synth_geoms={},
+            output_path=tmp_path / "cells.geojson",
+            image_shape=(10, 10),
+            constrain_overlaps=False,
+            output_mask=tmp_path / "cells_rasterisation.tiff",
+        )
+
+    assert calls == [False]

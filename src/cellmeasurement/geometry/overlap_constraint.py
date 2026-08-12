@@ -13,11 +13,16 @@ import logging
 import time
 from typing import Any
 
+import numpy as np
+import shapely
 from shapely.geometry import Polygon, mapping, shape
 
 log = logging.getLogger(__name__)
 
 __all__ = ["constrain_cell_overlaps"]
+
+_PROGRESS_SECONDS = 60.0   # wall-clock gap between progress lines
+_PROGRESS_STRIDE = 1024    # iterations between clock reads
 
 
 def _ensure_largest_polygon(geom: Any) -> Polygon:
@@ -43,43 +48,41 @@ def _ensure_largest_polygon(geom: Any) -> Polygon:
     return Polygon()
 
 
-def _build_spatial_grid(geoms: list[Any]) -> dict[tuple[int, int], list[int]]:
-    """Build a broad-phase spatial grid keyed by integer cell coordinates."""
-    bounds = [g.bounds for g in geoms]
-    all_minx = min(b[0] for b in bounds)
-    all_miny = min(b[1] for b in bounds)
-    all_maxx = max(b[2] for b in bounds)
-    all_maxy = max(b[3] for b in bounds)
-    span = max(all_maxx - all_minx, all_maxy - all_miny, 1.0)
-    grid_size = max(span / max(int(len(geoms) ** 0.5), 1), 1.0)
-
-    grid: dict[tuple[int, int], list[int]] = {}
-    for i, (minx, miny, maxx, maxy) in enumerate(bounds):
-        gx0 = int((minx - all_minx) / grid_size)
-        gy0 = int((miny - all_miny) / grid_size)
-        gx1 = int((maxx - all_minx) / grid_size)
-        gy1 = int((maxy - all_miny) / grid_size)
-        for gx in range(gx0, gx1 + 1):
-            for gy in range(gy0, gy1 + 1):
-                grid.setdefault((gx, gy), []).append(i)
-    return grid
+def _geometry_array(geoms: list[Any]) -> np.ndarray:
+    """Wrap geometries in an object array for shapely's vectorised functions."""
+    arr = np.empty(len(geoms), dtype=object)
+    arr[:] = geoms
+    return arr
 
 
-def _pair_candidates(grid: dict[tuple[int, int], list[int]]) -> tuple[set[tuple[int, int]], list[tuple[int, int]]]:
-    """Generate unique candidate geometry pairs from shared grid buckets."""
-    checked: set[tuple[int, int]] = set()
-    pairs: list[tuple[int, int]] = []
-    for cell_list in grid.values():
-        for ii in range(len(cell_list)):
-            i = cell_list[ii]
-            for jj in range(ii + 1, len(cell_list)):
-                j = cell_list[jj]
-                pair = (min(i, j), max(i, j))
-                if pair in checked:
-                    continue
-                checked.add(pair)
-                pairs.append(pair)
-    return checked, pairs
+def _candidate_pairs(geoms: list[Any]) -> np.ndarray:
+    """Return ``(i, j)`` index pairs, ``i < j``, whose geometries intersect.
+
+    The STRtree does the bbox filter and the ``intersects`` predicate in C. The
+    area test stays in the trim loop because geometries are edited in place, so
+    overlap must be re-checked against the current geometry.
+    """
+    empty = np.empty((0, 2), dtype=np.intp)
+    if len(geoms) < 2:
+        return empty
+
+    t_start = time.perf_counter()
+    geom_arr = _geometry_array(geoms)
+    left, right = shapely.STRtree(geom_arr).query(geom_arr, predicate="intersects")
+
+    # query() reports self-hits and both directions; keep one copy of each pair.
+    upper = left < right
+    left, right = left[upper], right[upper]
+    if left.size == 0:
+        return empty
+
+    order = np.lexsort((right, left))  # stable trim order across runs
+    log.info(
+        "Overlap constraint broad phase complete in %.2fs: %d intersecting pairs",
+        time.perf_counter() - t_start,
+        left.size,
+    )
+    return np.column_stack((left[order], right[order]))
 
 
 def _has_meaningful_overlap(geom_a: Any, geom_b: Any) -> bool:
@@ -154,19 +157,35 @@ def constrain_cell_overlaps(features: list[dict[str, Any]]) -> list[dict[str, An
     geoms = [shape(f["geometry"]) for f in features]
     areas = [g.area for g in geoms]
 
-    grid = _build_spatial_grid(geoms)
-    checked, pairs = _pair_candidates(grid)
+    pairs = _candidate_pairs(geoms)
+    total = len(pairs)
+
+    # A pair can stop overlapping before its turn, so _trim_larger_cell re-checks.
     clipped = 0
-    for i, j in pairs:
-        if _trim_larger_cell(i, j, geoms, areas):
+    next_report = time.perf_counter() + _PROGRESS_SECONDS
+    for k in range(total):
+        i, j = pairs[k]
+        if _trim_larger_cell(int(i), int(j), geoms, areas):
             clipped += 1
+        if k % _PROGRESS_STRIDE == 0:
+            now = time.perf_counter()
+            if now >= next_report:
+                log.info(
+                    "Overlap constraint progress: %d/%d pairs (%.1f%%), elapsed=%.2fs, clipped=%d",
+                    k + 1,
+                    total,
+                    100.0 * (k + 1) / total,
+                    now - t_start,
+                    clipped,
+                )
+                next_report = now + _PROGRESS_SECONDS
 
     out = _finalize_features(features, geoms)
 
     log.info(
         "Overlap constraint complete in %.2fs: checked %d pairs, clipped %d, removed %d empty cells",
         time.perf_counter() - t_start,
-        len(checked),
+        total,
         clipped,
         n - len(out),
     )

@@ -46,6 +46,49 @@ SynthGeoms = dict[int, Polygon]
 logger = logging.getLogger(__name__)
 
 
+# Offsets in a classic TIFF are 32-bit, so the whole file must stay under 4 GB.
+CLASSIC_TIFF_LIMIT_BYTES = 4 * 1024**3
+
+# Label IDs are positive, so unsigned fits. uint32 indexes 4.29e9 labels -- past
+# any real slide -- and is the widest a label mask may use: cellmeasurement's own
+# reader (io/mask_io.py) rejects anything over 32-bit. uint16 still halves the
+# in-memory mask when the count fits, which is worth keeping at whole-slide sizes.
+_MASK_DTYPES = (np.uint16, np.uint32)
+
+
+def _mask_dtype(max_label: int) -> np.dtype:
+    """Return the narrowest unsigned dtype that can hold ``max_label``."""
+    # Rank by capacity rather than trusting declaration order.
+    for dtype in sorted(_MASK_DTYPES, key=lambda dt: np.iinfo(dt).max):
+        if max_label <= np.iinfo(dtype).max:
+            return np.dtype(dtype)
+    widest = max(_MASK_DTYPES, key=lambda dt: np.iinfo(dt).max)
+    raise ValueError(
+        f"{max_label} labels exceeds the {np.iinfo(widest).max} label limit "
+        f"of {np.dtype(widest).name} masks."
+    )
+
+
+_BIGTIFF_RETRY_EXCEPTIONS = (ValueError, OverflowError, OSError)
+_BIGTIFF_RETRY_HINTS = (
+    "bigtiff",
+    "classic tiff",
+    "4 gb",
+    "4gb",
+    "offset",
+    "ifd",
+    "too large",
+    "out of range",
+    "cannot fit",
+)
+
+
+def _is_classic_tiff_size_error(exc: Exception) -> bool:
+    """Return True if an exception indicates classic-TIFF size/offset overflow."""
+    msg = str(exc).lower()
+    return any(hint in msg for hint in _BIGTIFF_RETRY_HINTS)
+
+
 def _rasterise_features_to_mask(
     features: list[dict],
     height: int,
@@ -80,8 +123,7 @@ def _rasterise_features_to_mask(
         max_id = max(max_id, cell_id)
         cell_geoms.append((geom.area, cell_id, geom))
 
-    dtype = np.int32 if max_id < (2**31) else np.int64
-    mask = np.zeros((height, width), dtype=dtype)
+    mask = np.zeros((height, width), dtype=_mask_dtype(max_id))
 
     # Largest cells first; smaller cells painted last win any contested pixels,
     # mirroring the "trim the larger by the smaller" rule of
@@ -365,13 +407,41 @@ def write_geojson(
     if output_mask is not None:
         t_mask_start = time.perf_counter()
         raster_mask = _rasterise_features_to_mask(features, H, W)
+        t_rasterise = time.perf_counter() - t_mask_start
         output_mask.parent.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(str(output_mask), raster_mask)
+
+        t_write_start = time.perf_counter()
+
+        # Write uncompressed: every viewer opens it without a deflate codec, the
+        # reader can memmap it, and on healthy scratch the raw write is fast.
+        # BigTIFF is required once the file exceeds the classic 4 GB limit; the
+        # file is now ~the array size, so check nbytes and still retry on an
+        # explicit classic-TIFF size/offset failure at the boundary.
+        bigtiff = raster_mask.nbytes >= CLASSIC_TIFF_LIMIT_BYTES
+        try:
+            tifffile.imwrite(str(output_mask), raster_mask, bigtiff=bigtiff)
+        except _BIGTIFF_RETRY_EXCEPTIONS as exc:
+            if bigtiff or not _is_classic_tiff_size_error(exc):
+                raise
+            logger.warning(
+                "Raster mask write failed in classic TIFF mode (%s); retrying as BigTIFF.",
+                exc,
+            )
+            tifffile.imwrite(str(output_mask), raster_mask, bigtiff=True)
+        t_write = time.perf_counter() - t_write_start
+
+        written = output_mask.stat().st_size
         logger.info(
-            "Raster mask export complete in %.2fs: path=%s, shape=%s",
+            "Raster mask export complete in %.2fs (rasterise=%.2fs, write=%.2fs): "
+            "path=%s, shape=%s, dtype=%s, %.2f GB raw -> %.2f GB on disk",
             time.perf_counter() - t_mask_start,
+            t_rasterise,
+            t_write,
             output_mask,
             raster_mask.shape,
+            raster_mask.dtype.name,
+            raster_mask.nbytes / 1e9,
+            written / 1e9,
         )
 
     logger.info("GeoJSON export total complete in %.2fs", time.perf_counter() - t_start)
