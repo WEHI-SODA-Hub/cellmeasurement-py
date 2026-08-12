@@ -327,16 +327,23 @@ def test_write_geojson_gzip_output(tmp_path: Path):
         (65535, "uint16"),  # boundary: still fits
         (65536, "uint32"),  # boundary: must widen
         (300_000, "uint32"),
-        (2**32, "uint64"),
+        (2**32 - 1, "uint32"),  # boundary: still fits uint32
     ],
 )
 def test_mask_dtype_picks_narrowest_unsigned_type(max_label, expected):
     assert _mask_dtype(max_label).name == expected
 
 
-def test_rasterisation_mask_is_compressed_and_round_trips(tmp_path: Path):
-    """The mask write dominates whole-slide runtime, and it is raw bytes that
-    cost. Compression must not change what comes back out."""
+def test_mask_dtype_rejects_counts_beyond_uint32():
+    # The mask reader (io/mask_io.py) rejects >32-bit label masks, so the writer
+    # must not emit one either -- raise rather than silently widen to uint64.
+    with pytest.raises(ValueError, match="exceeds the"):
+        _mask_dtype(2**32)
+
+
+def test_rasterisation_mask_is_uncompressed_and_round_trips(tmp_path: Path):
+    """The exported mask is viewer-facing, so it is written uncompressed: any
+    reader opens it and it stays memmap-able. Content must round-trip intact."""
     cells, wc_geoms = [], {}
     for cell_id in range(1, 21):
         x = (cell_id % 5) * 20
@@ -371,7 +378,7 @@ def test_rasterisation_mask_is_compressed_and_round_trips(tmp_path: Path):
 
     with tifffile.TiffFile(mask_path) as tif:
         page = tif.pages[0]
-        assert page.compression != 1  # 1 == COMPRESSION.NONE
+        assert page.compression == 1  # 1 == COMPRESSION.NONE
 
     mask = tifffile.imread(mask_path)
     assert mask.dtype == np.uint16  # 20 labels: narrowest that fits
@@ -416,7 +423,7 @@ def test_write_geojson_rasterisation_output(tmp_path: Path):
 def test_write_geojson_retries_mask_write_as_bigtiff_on_classic_limit_error(tmp_path: Path, monkeypatch):
     calls: list[bool] = []
 
-    def _fake_imwrite(path, data, *, compression, compressionargs, bigtiff):
+    def _fake_imwrite(path, data, *, bigtiff):
         calls.append(bool(bigtiff))
         if len(calls) == 1:
             raise ValueError("data too large for classic TIFF format")
@@ -453,7 +460,7 @@ def test_write_geojson_retries_mask_write_as_bigtiff_on_classic_limit_error(tmp_
 def test_write_geojson_mask_write_does_not_retry_unrelated_error(tmp_path: Path, monkeypatch):
     calls: list[bool] = []
 
-    def _fake_imwrite(path, data, *, compression, compressionargs, bigtiff):
+    def _fake_imwrite(path, data, *, bigtiff):
         calls.append(bool(bigtiff))
         raise OSError("permission denied")
 

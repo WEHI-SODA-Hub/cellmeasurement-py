@@ -46,23 +46,27 @@ SynthGeoms = dict[int, Polygon]
 logger = logging.getLogger(__name__)
 
 
-# Label masks are long runs of a repeated ID, so deflate shrinks them ~90x.
-MASK_COMPRESSION = "zlib"
-MASK_COMPRESSION_ARGS = {"level": 1}
-
 # Offsets in a classic TIFF are 32-bit, so the whole file must stay under 4 GB.
 CLASSIC_TIFF_LIMIT_BYTES = 4 * 1024**3
 
-# Narrowest first. Label IDs are positive, so unsigned fits and stays smaller.
-_MASK_DTYPES = (np.uint16, np.uint32, np.uint64)
+# Label IDs are positive, so unsigned fits. uint32 indexes 4.29e9 labels -- past
+# any real slide -- and is the widest a label mask may use: cellmeasurement's own
+# reader (io/mask_io.py) rejects anything over 32-bit. uint16 still halves the
+# in-memory mask when the count fits, which is worth keeping at whole-slide sizes.
+_MASK_DTYPES = (np.uint16, np.uint32)
 
 
 def _mask_dtype(max_label: int) -> np.dtype:
     """Return the narrowest unsigned dtype that can hold ``max_label``."""
-    for dtype in _MASK_DTYPES:
+    # Rank by capacity rather than trusting declaration order.
+    for dtype in sorted(_MASK_DTYPES, key=lambda dt: np.iinfo(dt).max):
         if max_label <= np.iinfo(dtype).max:
             return np.dtype(dtype)
-    return np.dtype(np.uint64)
+    widest = max(_MASK_DTYPES, key=lambda dt: np.iinfo(dt).max)
+    raise ValueError(
+        f"{max_label} labels exceeds the {np.iinfo(widest).max} label limit "
+        f"of {np.dtype(widest).name} masks."
+    )
 
 
 _BIGTIFF_RETRY_EXCEPTIONS = (ValueError, OverflowError, OSError)
@@ -406,21 +410,16 @@ def write_geojson(
         t_rasterise = time.perf_counter() - t_mask_start
         output_mask.parent.mkdir(parents=True, exist_ok=True)
 
-        # The write dominates whole-slide runtime, and raw byte count is the cost.
         t_write_start = time.perf_counter()
 
-        # BigTIFF is required when the written file exceeds the classic TIFF
-        # limit. Start with a conservative raw-size check, then retry in
-        # BigTIFF mode only for explicit classic-TIFF size/offset failures.
+        # Write uncompressed: every viewer opens it without a deflate codec, the
+        # reader can memmap it, and on healthy scratch the raw write is fast.
+        # BigTIFF is required once the file exceeds the classic 4 GB limit; the
+        # file is now ~the array size, so check nbytes and still retry on an
+        # explicit classic-TIFF size/offset failure at the boundary.
         bigtiff = raster_mask.nbytes >= CLASSIC_TIFF_LIMIT_BYTES
         try:
-            tifffile.imwrite(
-                str(output_mask),
-                raster_mask,
-                compression=MASK_COMPRESSION,
-                compressionargs=MASK_COMPRESSION_ARGS,
-                bigtiff=bigtiff,
-            )
+            tifffile.imwrite(str(output_mask), raster_mask, bigtiff=bigtiff)
         except _BIGTIFF_RETRY_EXCEPTIONS as exc:
             if bigtiff or not _is_classic_tiff_size_error(exc):
                 raise
@@ -428,13 +427,7 @@ def write_geojson(
                 "Raster mask write failed in classic TIFF mode (%s); retrying as BigTIFF.",
                 exc,
             )
-            tifffile.imwrite(
-                str(output_mask),
-                raster_mask,
-                compression=MASK_COMPRESSION,
-                compressionargs=MASK_COMPRESSION_ARGS,
-                bigtiff=True,
-            )
+            tifffile.imwrite(str(output_mask), raster_mask, bigtiff=True)
         t_write = time.perf_counter() - t_write_start
 
         written = output_mask.stat().st_size
