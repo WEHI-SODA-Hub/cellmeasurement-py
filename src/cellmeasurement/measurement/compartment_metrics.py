@@ -267,6 +267,11 @@ def add_environment_measurements(
     Unlike :func:`add_expansion_measurements` (which yields multiple bins),
     this computes one aggregate environment compartment covering the full
     20 µm ring outside the cell boundary.
+
+    Only per-channel intensity is emitted. The zone's own geometry is used to
+    build the ring but is not reported: the 20 µm reach is fixed by definition,
+    so its pixel count and its size relative to the cell are determined by the
+    cell's own area and the pixel size rather than being new information.
     """
     environment_um = 20.0
     expansion_px = max(1, int(round(environment_um / pixel_size_microns)))
@@ -280,9 +285,6 @@ def add_environment_measurements(
     if env_area == 0:
         return
 
-    base_area = int(np.count_nonzero(cm))
-    props["Cell: Environment_20um: Pixel_Count"] = float(env_area)
-    props["Cell: Environment_20um: Area_Fraction"] = float(env_area / base_area) if base_area > 0 else 0.0
     for ci, ch in enumerate(ch_names):
         # Keep the same stat family as base compartment metrics for consistency.
         vals = image_cyx[ci][env_mask]

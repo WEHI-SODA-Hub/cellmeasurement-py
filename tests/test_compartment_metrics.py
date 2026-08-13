@@ -229,29 +229,42 @@ def test_erosion_bin1_contains_outer_boundary_ring() -> None:
     assert np.all(bin1_ring[outer_ring])
 
 
-def test_add_environment_measurements_emits_keys_and_nonzero_area() -> None:
+def test_add_environment_measurements_emits_intensity_keys_only() -> None:
     mask = _circular_mask(15)
     image = np.ones((2, *mask.shape), dtype=np.float32)
     props: dict[str, float] = {}
 
     add_environment_measurements(props, image, ["ch1", "ch2"], mask, pixel_size_microns=0.5)
 
-    assert props["Cell: Environment_20um: Pixel_Count"] > 0
-    assert "Cell: Environment_20um: Area_Fraction" in props
-    assert "ch1: Cell: Environment_20um: Mean" in props
-    assert "ch2: Cell: Environment_20um: Mean" in props
+    for ch in ("ch1", "ch2"):
+        for stat in ("Mean", "Median", "Min", "Max", "Std.Dev."):
+            assert f"{ch}: Cell: Environment_20um: {stat}" in props
+
+    # The zone's own geometry is not reported.
+    assert "Cell: Environment_20um: Pixel_Count" not in props
+    assert "Cell: Environment_20um: Area_Fraction" not in props
 
 
-def test_add_environment_measurements_pixel_size_controls_environment_area() -> None:
+def test_add_environment_measurements_pixel_size_controls_environment_reach() -> None:
+    """A finer pixel size puts 20 µm further out, so the ring reaches further.
+
+    Measured through the emitted intensity rather than a pixel count: on an
+    image whose value is the distance from the mask centre, a ring that
+    extends further out has a higher mean.
+    """
     mask = _circular_mask(15, size=200)
-    image = np.ones((1, *mask.shape), dtype=np.float32)
+    centre = 200 // 2
+    yy, xx = np.ogrid[:200, :200]
+    radial = np.sqrt((xx - centre) ** 2 + (yy - centre) ** 2).astype(np.float32)[np.newaxis]
+
     coarse_props: dict[str, float] = {}
     fine_props: dict[str, float] = {}
 
-    add_environment_measurements(coarse_props, image, ["ch1"], mask, pixel_size_microns=1.0)
-    add_environment_measurements(fine_props, image, ["ch1"], mask, pixel_size_microns=0.5)
+    add_environment_measurements(coarse_props, radial, ["ch1"], mask, pixel_size_microns=1.0)
+    add_environment_measurements(fine_props, radial, ["ch1"], mask, pixel_size_microns=0.5)
 
-    assert fine_props["Cell: Environment_20um: Pixel_Count"] > coarse_props["Cell: Environment_20um: Pixel_Count"]
+    assert fine_props["ch1: Cell: Environment_20um: Max"] > coarse_props["ch1: Cell: Environment_20um: Max"]
+    assert fine_props["ch1: Cell: Environment_20um: Mean"] > coarse_props["ch1: Cell: Environment_20um: Mean"]
 
 
 def test_add_environment_measurements_empty_mask_is_noop() -> None:
