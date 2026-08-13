@@ -494,9 +494,10 @@ def test_measure_cells_tiled_environment_expansion(tmp_path: Path):
     )
 
     props = measured[1]
-    assert props["Cell: Environment_20um: Pixel_Count"] > 0
     assert "Channel 1: Cell: Environment_20um: Mean" in props
     assert props["Channel 1: Cell: Environment_20um: Mean"] == 7.0
+    assert "Cell: Environment_20um: Pixel_Count" not in props
+    assert "Cell: Environment_20um: Area_Fraction" not in props
 
 
 def test_measure_cells_tiled_wc_only_skips_cytoplasm_keeps_membrane(tmp_path: Path):
